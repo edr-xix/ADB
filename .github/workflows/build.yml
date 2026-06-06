@@ -41,7 +41,7 @@ jobs:
 
       - name: Execute PyInstaller Build
         run: |
-          pyinstaller --clean --windowed --onefile --name="AdbApp" adb.py
+          pyinstaller --clean --windowed --onefile --name="ADB" adb.py
         shell: bash
 
       - name: Compress OS-Specific Target
@@ -50,11 +50,11 @@ jobs:
           cd dist
           if [ "$RUNNER_OS" == "macOS" ]; then
             # Compress only the .app bundle, ignore the UNIX executable
-            zip -r ../AdbApp-macOS.zip AdbApp.app
+            zip -r ../ADB-macOS.zip ADB.app
           elif [ "$RUNNER_OS" == "Windows" ]; then
-            7z a ../AdbApp-Windows.zip AdbApp.exe
+            7z a ../ADB-Windows.zip ADB.exe
           else
-            zip ../AdbApp-Linux.zip AdbApp
+            zip ../ADB-Linux.zip ADB
           fi
 
       - name: Publish to GitHub Releases
