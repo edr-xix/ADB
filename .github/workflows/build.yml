@@ -5,6 +5,10 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+# Required to allow the pipeline to generate a Release page
+permissions:
+  contents: write
+
 jobs:
   release-builds:
     strategy:
@@ -40,12 +44,24 @@ jobs:
           pyinstaller --clean --windowed --onefile --name="AdbApp" adb.py
         shell: bash
 
-      - name: Upload Binaries
-        uses: actions/upload-artifact@v4
+      - name: Compress OS-Specific Target
+        shell: bash
+        run: |
+          cd dist
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            # Compress only the .app bundle, ignore the UNIX executable
+            zip -r ../AdbApp-macOS.zip AdbApp.app
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            7z a ../AdbApp-Windows.zip AdbApp.exe
+          else
+            zip ../AdbApp-Linux.zip AdbApp
+          fi
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
         with:
-          name: App-${{ matrix.os }}
-          path: |
-            dist/AdbApp
-            dist/AdbApp.exe
-            dist/AdbApp.app/
-          if-no-files-found: warn
+          tag_name: latest
+          name: "Latest Build"
+          make_latest: true
+          files: |
+            *.zip
