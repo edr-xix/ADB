@@ -3,8 +3,8 @@ import os
 import subprocess
 import re
 import tempfile
-import time  
-import shlex  
+import time
+import shlex
 import stat
 import traceback
 import adbutils
@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QTextEdit, QFileDialog, QMessageBox, QInputDialog,
                              QRadioButton, QDialog, QScrollArea, QStyle,
-                             QCheckBox) 
+                             QCheckBox, QGroupBox) 
 from PyQt6.QtCore import QSettings, QTimer, QProcess, Qt, QMimeData, QUrl, QThread, pyqtSignal
 from PyQt6.QtGui import QDrag
 
@@ -72,7 +72,6 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
 APP_VERSION = "0.0.13-beta"
 
 class TrackedFile:
-    """Wraps a local file object and calculates exact delta cursor movements."""
     def __init__(self, filepath, update_callback):
         self.file = open(filepath, 'rb')
         self.update_callback = update_callback
@@ -301,7 +300,6 @@ class AdbTransferThread(QThread):
             err_msg = f"Exception: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             self.finished_transfer.emit(False, err_msg)
 
-
 class PreferencesDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -370,7 +368,7 @@ class PreferencesDialog(QDialog):
 
         self.announce_transfers_checkbox = QCheckBox("Announce File Transfer Progress")
         self.announce_transfers_checkbox.setAccessibleName("Announce File Transfer Progress")
-        self.announce_transfers_checkbox.setAccessibleDescription("When enabled, VoiceOver will dynamically read percentage updates during file transfers.")
+        self.announce_transfers_checkbox.setAccessibleDescription("When enabled, the screen reader will dynamically read percentage updates during file transfers.")
         self.announce_transfers_checkbox.setChecked(self.main_app.announce_transfers)
         layout.addWidget(self.announce_transfers_checkbox)
 
@@ -404,15 +402,11 @@ class PreferencesDialog(QDialog):
         rn_text = QTextEdit()
         rn_text.setReadOnly(True)
         rn_text.setText(f"Version {APP_VERSION}\n"
+                        "- Replaced TTS speech logic with native screen reader event alerts for seamless accessibility.\n"
+                        "- Organized UI elements into accessible GroupBoxes.\n"
                         "- Fixed macOS File Promises to properly track file expansion in Finder during active stream.\n"
-                        "- Added toggle to disable file size calculation for faster File Manager loading.\n"
-                        "- Added dynamic 'Stop Speech' button for VoiceOver interruptions.\n"
-                        "- Progress indicators now auto-hide when idle to improve privacy.\n"
-                        "- Relabeled Device Manager and Preferences for cleaner screen reader navigation.\n"
-                        "- Redesigned Android Browser: Removed intrusive pop-ups. Replaced with dedicated Menu button and active item selection.\n"
-                        "- Recalibrated file tracker using absolute byte cursors to prevent >100% bugs.\n"
-                        "- Rebuilt bidirectional dragging; you can drag native Mac files directly onto the browser window to push them to the active directory.\n"
-                        "- Testing beta accessibility features.")
+                        "- Improved fallback QDrag for standard file managers.\n"
+                        "- Recalibrated file tracker using absolute byte cursors to prevent >100% bugs.")
         rn_text.setMaximumHeight(100)
         rn_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         layout.addWidget(rn_text)
@@ -747,11 +741,11 @@ class AccessibleAndroidBrowser(QDialog):
         item_lbl.setStyleSheet("font-weight: bold;")
         layout.addWidget(item_lbl)
 
-        btn_copy_mac = QPushButton("Copy to Mac")
+        btn_copy_mac = QPushButton("Copy to Computer")
         btn_copy_mac.clicked.connect(lambda: [dialog.accept(), self.action_pull(target_path, move=False)])
         layout.addWidget(btn_copy_mac)
 
-        btn_move_mac = QPushButton("Move to Mac")
+        btn_move_mac = QPushButton("Move to Computer")
         btn_move_mac.clicked.connect(lambda: [dialog.accept(), self.action_pull(target_path, move=True)])
         layout.addWidget(btn_move_mac)
 
@@ -771,7 +765,7 @@ class AccessibleAndroidBrowser(QDialog):
 
         layout.addWidget(QLabel("Global Actions:"))
 
-        btn_push_mac = QPushButton("Push File/Folder from Mac")
+        btn_push_mac = QPushButton("Push File/Folder from Computer")
         btn_push_mac.clicked.connect(lambda: [dialog.accept(), self.action_push_from_mac()])
         layout.addWidget(btn_push_mac)
 
@@ -787,7 +781,7 @@ class AccessibleAndroidBrowser(QDialog):
 
     def action_push_from_mac(self):
         msg = QMessageBox(self)
-        msg.setWindowTitle("Push from Mac")
+        msg.setWindowTitle("Push to Device")
         msg.setText("What would you like to push?")
         btn_file = msg.addButton("File(s)", QMessageBox.ButtonRole.ActionRole)
         btn_folder = msg.addButton("Folder", QMessageBox.ButtonRole.ActionRole)
@@ -827,7 +821,7 @@ class AccessibleAndroidBrowser(QDialog):
                 self.load_directory(self.current_path)
         
     def action_pull(self, target_path, move=False):
-        local_dest = QFileDialog.getExistingDirectory(self, "Select Save Destination on Mac")
+        local_dest = QFileDialog.getExistingDirectory(self, "Select Save Destination")
         if local_dest:
             if self.parent():
                 action = "move_to_mac" if move else "pull"
@@ -997,7 +991,6 @@ class ADBClient(QMainWindow):
         self.command_output_buffer = ""
         self.default_android_dir = self.settings.value("default_android_dir", "")
         self.current_target_serial = None
-        self.speech_processes = []
         
         self.setWindowTitle("ADB and Fastboot Tool")
         self.setAccessibleName("ADB and Fastboot Main Window")
@@ -1044,67 +1037,36 @@ class ADBClient(QMainWindow):
         if QT_ACCESSIBILITY_AVAILABLE:
             self.log_output.setAccessibleDescription(message.strip())
             QAccessible.updateAccessibility(QAccessibleEvent(self.log_output, QAccessible.Event.Alert))
-            if sys.platform != "darwin":
-                return
-
-        if sys.platform == "darwin":
-            proc = subprocess.Popen(["say", message.strip()], stderr=subprocess.DEVNULL)
-            self.speech_processes.append(proc)
-        elif sys.platform == "win32":
-            safe_msg = message.replace('"', '""').replace("'", "''")
-            script = f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{safe_msg}')"
-            try:
-                proc = subprocess.Popen(["powershell", "-WindowStyle", "Hidden", "-Command", script], creationflags=subprocess.CREATE_NO_WINDOW)
-                self.speech_processes.append(proc)
-            except AttributeError:
-                proc = subprocess.Popen(["powershell", "-WindowStyle", "Hidden", "-Command", script])
-                self.speech_processes.append(proc)
-        elif sys.platform.startswith("linux"):
-            proc = subprocess.Popen(["spd-say", message], stderr=subprocess.DEVNULL)
-            self.speech_processes.append(proc)
-            
-        self.speech_processes = [p for p in self.speech_processes if p.poll() is None]
-
-    def stop_speech(self):
-        for p in self.speech_processes:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        self.speech_processes.clear()
-        
-        if sys.platform == "darwin":
-            subprocess.Popen(["killall", "say"], stderr=subprocess.DEVNULL)
-        elif sys.platform.startswith("linux"):
-            subprocess.Popen(["spd-say", "-S"], stderr=subprocess.DEVNULL)
 
     def setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        layout = QVBoxLayout()
-        central_widget.setLayout(layout)
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        central_widget.setLayout(main_layout)
 
+        # Top Controls Group
+        top_group = QGroupBox("Configuration")
+        top_layout = QVBoxLayout()
+        top_group.setLayout(top_layout)
+        
         prefs_layout = QHBoxLayout()
         self.prefs_btn = QPushButton("Preferences")
         self.prefs_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogListView))
         self.prefs_btn.setAccessibleName("Preferences")
-        self.prefs_btn.setAccessibleDescription("")
         self.prefs_btn.clicked.connect(self.open_preferences)
         prefs_layout.addStretch()
         prefs_layout.addWidget(self.prefs_btn)
-        layout.addLayout(prefs_layout)
+        top_layout.addLayout(prefs_layout)
+        
+        main_layout.addWidget(top_group)
 
-        transfer_label = QLabel("File Transfers (Or Drag and Drop file here):")
-        self.wizard_btn = QPushButton("File Manager")
-        self.wizard_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
-        self.wizard_btn.setAccessibleName("File Manager")
-        self.wizard_btn.setAccessibleDescription("Click to open the file manager for pushing, pulling, moving, or deleting files.")
-        self.wizard_btn.clicked.connect(self.start_transfer_wizard)
+        # Device Manager Group
+        dev_group = QGroupBox("Device Connection")
+        dev_layout = QVBoxLayout()
+        dev_group.setLayout(dev_layout)
         
-        layout.addWidget(transfer_label)
-        layout.addWidget(self.wizard_btn)
-        
-        dev_layout = QHBoxLayout()
+        dev_inner_layout = QHBoxLayout()
         self.target_dev_label = QLabel("Target Device: Default / Any")
         self.target_dev_label.setAccessibleName("Current Target Device: Default or Any")
         
@@ -1113,13 +1075,36 @@ class ADBClient(QMainWindow):
         self.choose_dev_btn.setAccessibleName("Device Manager")
         self.choose_dev_btn.clicked.connect(self.open_device_picker)
         
-        dev_layout.addWidget(self.target_dev_label)
-        dev_layout.addWidget(self.choose_dev_btn)
-        dev_layout.addStretch()
-        layout.addLayout(dev_layout)
-
-        term_label = QLabel("Command Terminal:")
+        dev_inner_layout.addWidget(self.target_dev_label)
+        dev_inner_layout.addWidget(self.choose_dev_btn)
+        dev_inner_layout.addStretch()
+        dev_layout.addLayout(dev_inner_layout)
         
+        main_layout.addWidget(dev_group)
+
+        # Transfer Group
+        transfer_group = QGroupBox("File Management")
+        transfer_layout = QVBoxLayout()
+        transfer_group.setLayout(transfer_layout)
+        
+        transfer_label = QLabel("File Transfers (Or Drag and Drop file here):")
+        self.wizard_btn = QPushButton("Open File Manager")
+        self.wizard_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon))
+        self.wizard_btn.setAccessibleName("Open File Manager")
+        self.wizard_btn.setAccessibleDescription("Click to open the file manager for pushing, pulling, moving, or deleting files.")
+        self.wizard_btn.clicked.connect(self.start_transfer_wizard)
+        
+        transfer_layout.addWidget(transfer_label)
+        transfer_layout.addWidget(self.wizard_btn)
+        
+        main_layout.addWidget(transfer_group)
+
+        # Terminal Group
+        term_group = QGroupBox("Command Terminal")
+        term_layout = QVBoxLayout()
+        term_group.setLayout(term_layout)
+        
+        cmd_layout = QHBoxLayout()
         self.adb_radio = QRadioButton("ADB")
         self.adb_radio.setChecked(True)
         self.adb_radio.setAccessibleName("Use ADB Tool")
@@ -1138,25 +1123,38 @@ class ADBClient(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_command)
 
-        cmd_layout = QHBoxLayout()
         cmd_layout.addWidget(self.adb_radio)
         cmd_layout.addWidget(self.fastboot_radio)
         cmd_layout.addWidget(self.cmd_input)
         cmd_layout.addWidget(self.stop_btn)
         
-        layout.addWidget(term_label)
-        layout.addLayout(cmd_layout)
+        term_layout.addLayout(cmd_layout)
+        main_layout.addWidget(term_group)
 
-        out_layout = QHBoxLayout()
-        out_label = QLabel("Terminal Output:")
+        # Output Group
+        out_group = QGroupBox("Terminal Output & Status")
+        out_layout = QVBoxLayout()
+        out_group.setLayout(out_layout)
+        
+        header_layout = QHBoxLayout()
         
         self.status_label = QLabel("Status: Idle")
         self.status_label.setAccessibleName("Status: Idle")
-        self.status_label.setStyleSheet("font-weight: bold; color: #0078D7; font-size: 14px; margin-left: 15px;")
+        self.status_label.setStyleSheet("font-weight: bold; color: #0078D7; font-size: 14px;")
+        
+        self.clear_btn = QPushButton("Clear Terminal")
+        self.clear_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+        self.clear_btn.setAccessibleName("Clear Terminal Output")
+        self.clear_btn.clicked.connect(self.clear_log)
+        
+        header_layout.addWidget(self.status_label)
+        header_layout.addStretch()
+        header_layout.addWidget(self.clear_btn)
+        out_layout.addLayout(header_layout)
         
         self.stats_container = QWidget()
         self.stats_layout = QVBoxLayout(self.stats_container)
-        self.stats_layout.setContentsMargins(15, 0, 15, 0)
+        self.stats_layout.setContentsMargins(0, 5, 0, 10)
         
         self.pct_label = QLabel("Overall Progress: 0%")
         self.pct_label.setAccessibleName("Overall Progress: 0 percent")
@@ -1173,24 +1171,7 @@ class ADBClient(QMainWindow):
         self.stats_layout.addWidget(self.file_label)
         
         self.stats_container.hide()
-
-        self.stop_speech_btn = QPushButton("Stop Speech")
-        self.stop_speech_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
-        self.stop_speech_btn.setAccessibleName("Stop Speech")
-        self.stop_speech_btn.clicked.connect(self.stop_speech)
-        self.stop_speech_btn.setVisible(self.announce_terminal)
-
-        self.clear_btn = QPushButton("Clear Terminal")
-        self.clear_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
-        self.clear_btn.setAccessibleName("Clear Terminal Output")
-        self.clear_btn.clicked.connect(self.clear_log)
-        
-        out_layout.addWidget(out_label)
-        out_layout.addWidget(self.status_label)
         out_layout.addWidget(self.stats_container)
-        out_layout.addStretch()
-        out_layout.addWidget(self.stop_speech_btn)
-        out_layout.addWidget(self.clear_btn)
         
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
@@ -1206,20 +1187,18 @@ class ADBClient(QMainWindow):
             }
         """)
         
-        self.update_live_region_settings()
+        out_layout.addWidget(self.log_output)
+        main_layout.addWidget(out_group)
         
-        layout.addLayout(out_layout)
-        layout.addWidget(self.log_output)
+        self.update_live_region_settings()
 
     def update_live_region_settings(self):
         if self.announce_terminal:
             self.log_output.setProperty("container-live", "polite")
             self.log_output.setProperty("live", "polite")
-            self.stop_speech_btn.setVisible(True)
         else:
             self.log_output.setProperty("container-live", "none")
             self.log_output.setProperty("live", "none")
-            self.stop_speech_btn.setVisible(False)
 
     def check_configuration(self):
         if not self.adb_path or not os.path.exists(self.adb_path):
@@ -1274,15 +1253,15 @@ class ADBClient(QMainWindow):
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setText(f"Welcome to version {APP_VERSION}!\n\n"
                     "What's New:\n"
+                    "- Replaced TTS speech logic with native screen reader event alerts for seamless accessibility.\n"
+                    "- Organized UI elements into accessible GroupBoxes.\n"
                     "- Fixed macOS File Promises to properly track file expansion in Finder during active stream.\n"
                     "- Added toggle to disable file size calculation for faster File Manager loading.\n"
-                    "- Added dynamic 'Stop Speech' button for VoiceOver interruptions.\n"
                     "- Progress indicators now automatically hide when idle for privacy.\n"
                     "- Relabeled Device Manager and Preferences for cleaner screen reader navigation.\n"
                     "- Redesigned Android Browser: Removed intrusive pop-ups. Replaced with dedicated Menu button and active item selection.\n"
                     "- Recalibrated file tracker using absolute byte cursors to strictly prevent >100% bugs.\n"
-                    "- Refactored Global UI actions directly into the master Action Menu.\n"
-                    "- Testing beta accessibility features.")
+                    "- Refactored Global UI actions directly into the master Action Menu.")
         msg.exec()
 
     def open_preferences(self):
