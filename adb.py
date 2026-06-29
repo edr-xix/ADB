@@ -69,7 +69,7 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
         def draggingSession_sourceOperationMaskForDraggingContext_(self, session, context):
             return NSDragOperationCopy
 
-APP_VERSION = "0.0.13-beta"
+APP_VERSION = "0.0.14-beta"
 
 class TrackedFile:
     def __init__(self, filepath, update_callback):
