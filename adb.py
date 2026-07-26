@@ -48,9 +48,19 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
         def filePromiseProvider_writePromiseToURL_completionHandler_(self, provider, url, handler):
             dest_path = url.path()
             
+            try:
+                open(dest_path, 'ab').close()
+            except Exception:
+                pass
+            
             def on_transfer_complete(success, msg):
                 if handler:
                     handler(None)
+                if self.main_window and self.main_window.transfer_thread:
+                    try:
+                        self.main_window.transfer_thread.finished_transfer.disconnect(on_transfer_complete)
+                    except TypeError:
+                        pass
 
             def trigger_transfer():
                 try:
@@ -70,6 +80,30 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
             return NSDragOperationCopy
 
 APP_VERSION = "0.0.14-beta"
+
+class TerminalLineEdit(QLineEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            paths = [u.toLocalFile() for u in urls if os.path.exists(u.toLocalFile())]
+            if paths:
+                current_text = self.text()
+                paths_str = " ".join([shlex.quote(p) for p in paths])
+                new_text = f"{current_text} {paths_str}".strip()
+                self.setText(new_text)
+                event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
 class TrackedFile:
     def __init__(self, filepath, update_callback):
@@ -714,7 +748,6 @@ class AccessibleAndroidBrowser(QDialog):
             args = ["push"] + local_paths + [self.current_path]
             if self.parent():
                 self.parent().execute_tool("ADB", args)
-            self.accept()
 
     def go_up(self):
         if self.current_path != "/":
@@ -1024,11 +1057,8 @@ class ADBClient(QMainWindow):
         urls = event.mimeData().urls()
         local_paths = [u.toLocalFile() for u in urls if os.path.exists(u.toLocalFile())]
         if local_paths:
-            serial = self.get_current_serial()
-            dialog = AccessibleAndroidBrowser(self.adb_path, serial=serial, mode="push", start_path=self.default_android_dir, parent=self)
-            if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_path:
-                args = ["push"] + local_paths + [dialog.selected_path]
-                self.execute_tool("ADB", args)
+            args = ["push"] + local_paths + [self.default_android_dir]
+            self.execute_tool("ADB", args)
 
     def announce(self, message):
         if not message.strip():
@@ -1112,7 +1142,7 @@ class ADBClient(QMainWindow):
         self.fastboot_radio = QRadioButton("Fastboot")
         self.fastboot_radio.setAccessibleName("Use Fastboot Tool")
 
-        self.cmd_input = QLineEdit()
+        self.cmd_input = TerminalLineEdit()
         self.cmd_input.setAccessibleName("Command Input")
         self.cmd_input.setAccessibleDescription("Type raw arguments here. Do not include 'adb' or 'fastboot'. Press Enter to run.")
         self.cmd_input.returnPressed.connect(self.run_command)
