@@ -32,7 +32,7 @@ try:
     import objc
     from AppKit import (NSObject, NSFilePromiseProvider, NSDraggingItem, NSImage,
                          NSSize, NSApp, NSDragOperationCopy, NSPasteboard)
-    from Foundation import NSURL, NSError
+    from Foundation import NSURL, NSError, NSProgress
     PYOBJC_AVAILABLE = True
 except ImportError:
     PYOBJC_AVAILABLE = False
@@ -62,7 +62,7 @@ class _PromiseBridge(QObject):
     Emitting a Qt signal here IS safe from any thread, because Qt detects
     the emitting thread differs from the receiving object's thread and
     automatically queues delivery onto that object's event loop."""
-    pull_requested = pyqtSignal(str, str, object)
+    pull_requested = pyqtSignal(str, str, object, object)
 
 
 # --- macOS file promise *provider* (drag OUT of this app) ------------------------
@@ -549,9 +549,9 @@ class PreferencesDialog(QDialog):
         rn_text.setMaximumHeight(120)
         rn_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         layout.addWidget(rn_text)
-        version_label = QLabel(f"Developers: Elwin Rivera, Claude, and Gemini")
+        version_label = QLabel(f"Developers: Elwin Rivera, Claude AI, and Gemini AI")
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        version_label.setAccessibleName(f"Developers: Elwin Rivera and Gemini.")
+        version_label.setAccessibleName(f"Developers: Elwin Rivera, Claude AI, and Gemini AI.")
         layout.addWidget(version_label)
         
         self.save_prefs_btn = QPushButton("Save Preferences")
@@ -1566,7 +1566,7 @@ class ADBClient(QMainWindow):
                 self.announce("File transfer failed or was cancelled.")
             self.log(f"--- Transfer Error:\n{message}\n---")
             
-        QTimer.singleShot(5000, self.hide_stats_if_idle)
+            QTimer.singleShot(5000, self.hide_stats_if_idle)
     def stop_command(self):
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self.log("Stopping process...")
