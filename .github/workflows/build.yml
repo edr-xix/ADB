@@ -48,7 +48,7 @@ jobs:
         run: |
           cd dist
           if [ "$RUNNER_OS" == "macOS" ]; then
-            zip -r ../ADB-macOS.zip ADB.app
+            ditto -c -k --sequesterRsrc --keepParent ADB.app ../ADB-macOS.zip
           elif [ "$RUNNER_OS" == "Windows" ]; then
             7z a ../ADB-Windows.zip ADB
           else
