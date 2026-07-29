@@ -549,7 +549,7 @@ class PreferencesDialog(QDialog):
         rn_text.setMaximumHeight(120)
         rn_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         layout.addWidget(rn_text)
-        version_label = QLabel(f"Developers: Elwin Rivera,  and Gemini")
+        version_label = QLabel(f"Developers: Elwin Rivera, Claude, and Gemini")
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         version_label.setAccessibleName(f"Developers: Elwin Rivera and Gemini.")
         layout.addWidget(version_label)
