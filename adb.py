@@ -63,6 +63,7 @@ class _PromiseBridge(QObject):
     the emitting thread differs from the receiving object's thread and
     automatically queues delivery onto that object's event loop."""
     pull_requested = pyqtSignal(str, str, object, object)
+    error_logged = pyqtSignal(str)
 
 
 # --- macOS file promise *provider* (drag OUT of this app) ------------------------
@@ -93,6 +94,17 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
             except Exception:
                 pass
 
+            # Finder expects long promise-writes to publish an NSProgress so
+            # it can show real percentage feedback instead of a static
+            # "Preparing..." spinner. Without this, large/slow transfers can
+            # look stalled or failed even though they're still running.
+            progress = None
+            try:
+                progress = NSProgress.progressWithTotalUnitCount_(100)
+            except Exception:
+                progress = None
+            self.progress = progress
+
             # This runs on a background AppKit queue -> hand off to the main
             # thread via the thread-safe signal bridge instead of touching
             # Qt directly (the old QTimer.singleShot-from-background-thread
@@ -100,11 +112,14 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
             if self.main_window is not None:
                 try:
                     self.main_window.promise_bridge.pull_requested.emit(
-                        self.remote_path, dest_path, handler
+                        self.remote_path, dest_path, handler, progress
                     )
                     return
                 except Exception as e:
-                    print(f"File Promise Handoff Error: {e}")
+                    try:
+                        self.main_window.log_error_from_thread(f"File Promise Handoff Error: {e}")
+                    except Exception:
+                        print(f"File Promise Handoff Error: {e}")
 
             try:
                 handler(None)
@@ -208,7 +223,7 @@ def resolve_drop_paths(mime_data, temp_dir_hint, callback):
     return False
 
 
-APP_VERSION = "0.0.15-beta"
+APP_VERSION = "0.0.16-beta"
 class TerminalLineEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -540,13 +555,17 @@ class PreferencesDialog(QDialog):
         rn_text = QTextEdit()
         rn_text.setReadOnly(True)
         rn_text.setText(f"Version {APP_VERSION}\n"
+                        "- Fixed a real bug behind large drag-out failures: the old fallback drag path buffered adb's progress text in a never-trimmed string for the whole transfer, which slowed to a crawl on big files. Replaced with a byte-counted chunked pull.\n"
+                        "- Outgoing macOS File Promises now publish real NSProgress so Finder shows an actual percentage on large/slow transfers instead of a static 'Preparing...' spinner.\n"
+                        "- File-promise and drag errors are now written to the visible Terminal Output log instead of a console print() that a packaged app's user could never see.\n"
+                        "- Added a one-time startup check that reports whether native macOS drag-out support actually loaded, with install instructions if not.\n"
+                        "- Large-file drags on the non-native fallback path now warn up front and suggest 'Copy to Computer' instead of silently struggling.\n"
                         "- Fixed drag-and-drop acceptance: added missing dragMoveEvent handlers so drags from Finder (and elsewhere) are no longer rejected mid-drag.\n"
                         "- Fixed a thread-safety bug in outgoing macOS File Promises: AppKit's write callback now hands off to the Qt main thread through a proper signal instead of touching Qt objects from a background thread.\n"
                         "- Outgoing File Promises now correctly handle dragging whole folders, not just single files.\n"
-                        "- Failed or busy drag-out promises now report an error to Finder instead of hanging indefinitely.\n"
                         "- Added support for receiving native macOS File Promises dropped into the app (e.g. from Photos, Mail, or browsers), in addition to plain Finder file drops.\n"
                         "- Added an 'Insert File Path' button next to the terminal input as a non-drag, screen-reader-friendly alternative to drag-and-drop.")
-        rn_text.setMaximumHeight(120)
+        rn_text.setMaximumHeight(140)
         rn_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         layout.addWidget(rn_text)
         version_label = QLabel(f"Developers: Elwin Rivera, Claude AI, and Gemini AI")
@@ -689,7 +708,9 @@ class DraggableItemButton(QPushButton):
             return
         if (event.pos() - self.drag_start_pos).manhattanLength() < QApplication.startDragDistance():
             return
-            
+
+        main_win = self.window()
+
         if sys.platform == "darwin" and PYOBJC_AVAILABLE:
             try:
                 self._mac_delegate = AdbPromiseDelegate.alloc().init()
@@ -697,7 +718,7 @@ class DraggableItemButton(QPushButton):
                 self._mac_delegate.remote_path = self.remote_path
                 self._mac_delegate.file_name = os.path.basename(self.remote_path.rstrip('/'))
                 self._mac_delegate.is_directory = self.is_dir
-                self._mac_delegate.main_window = self.window()
+                self._mac_delegate.main_window = main_win
                 
                 self._mac_provider = NSFilePromiseProvider.alloc().initWithFileType_delegate_("public.data", self._mac_delegate)
                 self._mac_drag_item = NSDraggingItem.alloc().initWithPasteboardWriter_(self._mac_provider)
@@ -712,46 +733,126 @@ class DraggableItemButton(QPushButton):
                     ns_view.beginDraggingSessionWithItems_event_source_([self._mac_drag_item], mac_event, self._mac_delegate)
                     return 
             except Exception as e:
-                print(f"File Promise Event Error: {e}")
-            return 
+                if main_win is not None and hasattr(main_win, "log_error_from_thread"):
+                    main_win.log_error_from_thread(f"Native drag-out failed to start ({e}); falling back to a slower method.")
+                else:
+                    print(f"File Promise Event Error: {e}")
+            # fall through to the generic fallback below rather than just
+            # silently returning and doing nothing.
+
+        self._run_fallback_drag(main_win)
+
+    def _estimate_remote_size(self):
+        """Quick stat call so we can show real percentages and warn about
+        very large items before committing to a blocking pull."""
+        subprocess.run([self.adb_cmd[0], "start-server"], check=False)
+        client = adbutils.AdbClient(host="127.0.0.1", port=5037)
+        serial = None
+        if "-s" in self.adb_cmd:
+            idx = self.adb_cmd.index("-s")
+            serial = self.adb_cmd[idx + 1]
+        device = client.device(serial) if serial else client.device()
+        return device.sync.stat(self.remote_path).size
+
+    def _pull_for_drag(self, local_dest, size_bytes):
+        """Chunked pull using adbutils directly, tracking raw byte counts.
+
+        The previous implementation shelled out to `adb pull -p` and
+        scraped percentages out of its text output into a string buffer
+        that was NEVER TRIMMED - it grew for the entire length of the
+        transfer. For a small file that finishes in a second or two this
+        was invisible; for a 60GB transfer, that unbounded string kept
+        getting re-copied on every append (classic O(n^2) behavior),
+        which could make the whole thing grind to a crawl or appear to
+        hang/fail long before completion. Tracking a plain integer byte
+        count instead avoids that entirely, and is also more reliable
+        than parsing `-p` output (format varies across adb versions)."""
+        subprocess.run([self.adb_cmd[0], "start-server"], check=False)
+        client = adbutils.AdbClient(host="127.0.0.1", port=5037)
+        serial = None
+        if "-s" in self.adb_cmd:
+            idx = self.adb_cmd.index("-s")
+            serial = self.adb_cmd[idx + 1]
+        device = client.device(serial) if serial else client.device()
+
+        bytes_done = 0
+        last_ui_update = 0.0
+        with open(local_dest, 'wb') as f:
+            for chunk in device.sync.iter_content(self.remote_path):
+                f.write(chunk)
+                bytes_done += len(chunk)
+                now = time.time()
+                if now - last_ui_update > 0.1:  # throttle UI text updates
+                    last_ui_update = now
+                    if size_bytes:
+                        pct = min(100, int(bytes_done / size_bytes * 100))
+                        self.setText(f"Preparing for drop... {pct}%")
+                    else:
+                        self.setText(f"Preparing for drop... {bytes_done / (1024 * 1024):.1f} MB")
+                    QApplication.processEvents()
+        return True
+
+    def _run_fallback_drag(self, main_win):
+        """Generic (non-macOS-promise) drag-out: the file has to be fully
+        downloaded locally before Qt's QDrag can start, which means
+        holding the mouse button down for the whole pull. There is no
+        real equivalent of macOS file promises exposed through Qt on
+        Windows/Linux, so for very large items we warn up front and
+        point at the non-drag 'Copy to Computer' action instead, rather
+        than let it silently struggle."""
         original_text = self.text()
+        try:
+            size_bytes = self._estimate_remote_size()
+        except Exception:
+            size_bytes = None
+
+        LARGE_THRESHOLD = 500 * 1024 * 1024  # 500 MB
+        if size_bytes and size_bytes > LARGE_THRESHOLD:
+            size_gb = size_bytes / (1024 ** 3)
+            proceed = QMessageBox.question(
+                self, "Large File",
+                f"This item is about {size_gb:.1f} GB. Dragging it out has to fully "
+                "download it first, and the mouse button has to stay held down the "
+                "whole time - for large files this is slow and easy to interrupt by "
+                "accident.\n\n"
+                "For large files, the item menu's 'Copy to Computer' action is much "
+                "more reliable.\n\nContinue with the drag anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if proceed != QMessageBox.StandardButton.Yes:
+                return
+
         self.setText("Preparing...")
         self.setEnabled(False)
+        QApplication.processEvents()
+
         temp_dir = tempfile.gettempdir()
         base_name = os.path.basename(self.remote_path.rstrip('/'))
         local_dest = os.path.join(temp_dir, base_name)
-        
-        cmd = self.adb_cmd + ["pull", "-p", self.remote_path, local_dest]
-        
-        process = QProcess()
-        process.setProgram(cmd[0])
-        process.setArguments(cmd[1:])
-        process.start()
-        
-        output_buffer = ""
-        
-        while process.state() != QProcess.ProcessState.NotRunning:
-            process.waitForReadyRead(50) 
-            
-            data = process.readAllStandardOutput().data().decode('utf-8', errors='replace')
-            data += process.readAllStandardError().data().decode('utf-8', errors='replace')
-            
-            if data:
-                output_buffer += data
-                matches = re.findall(r'(\d+)\s*%', output_buffer[-2000:])
-                if matches:
-                    self.setText(f"Preparing for drop... {matches[-1]}%")
-            
-            QApplication.processEvents()
+
+        success = False
+        error_message = None
+        try:
+            success = self._pull_for_drag(local_dest, size_bytes)
+        except Exception as e:
+            error_message = f"{e}\n\n{traceback.format_exc()}"
+            success = False
+
         self.setText(original_text)
         self.setEnabled(True)
-        
-        if os.path.exists(local_dest):
+
+        if success and os.path.exists(local_dest):
             drag = QDrag(self)
             mime = QMimeData()
             mime.setUrls([QUrl.fromLocalFile(local_dest)])
             drag.setMimeData(mime)
             drag.exec(Qt.DropAction.CopyAction)
+        else:
+            msg = f"Could not prepare '{base_name}' for dragging."
+            if main_win is not None:
+                main_win.log(f"Drag-out failed: {msg}\n{error_message or ''}")
+            QMessageBox.warning(self, "Drag Failed", msg + (f"\n\n{error_message}" if error_message else ""))
 class AccessibleAndroidBrowser(QDialog):
     def __init__(self, adb_path, serial=None, mode="pull", start_path="/sdcard/", parent=None):
         super().__init__(parent)
@@ -1096,11 +1197,38 @@ class ADBClient(QMainWindow):
         # promise machinery (see AdbPromiseDelegate / _PromiseBridge above).
         self.promise_bridge = _PromiseBridge()
         self.promise_bridge.pull_requested.connect(self._handle_promise_pull)
+        self.promise_bridge.error_logged.connect(self._log_promise_error)
         
         self.setup_ui()
         QTimer.singleShot(500, self.check_configuration)
+        QTimer.singleShot(1500, self.check_promise_support)
     def get_current_serial(self):
         return self.current_target_serial
+    def log_error_from_thread(self, message):
+        """Safe to call from ANY thread (including AppKit's background
+        promise-writing queue). Errors from that code used to go to
+        print(), which is invisible once the app is packaged - nothing
+        the person running it could ever see. Routing through this signal
+        guarantees it lands in the visible terminal log."""
+        try:
+            self.promise_bridge.error_logged.emit(str(message))
+        except Exception:
+            print(message)
+    def _log_promise_error(self, message):
+        self.log(f"[File Promise] {message}")
+    def check_promise_support(self):
+        """One-time, visible diagnostic: on macOS, tell the person plainly
+        whether native drag-out (file promise) support actually loaded,
+        instead of silently falling back to the much slower/less reliable
+        QDrag path with no explanation."""
+        if sys.platform != "darwin":
+            return
+        if PYOBJC_AVAILABLE:
+            self.log("macOS file promise support: available (native drag-out enabled).", skip_announce=True)
+        else:
+            self.log("macOS file promise support: NOT available. Falling back to a slower, "
+                     "less reliable drag method - large drags may fail or appear stuck. "
+                     "Install the required package with: pip install pyobjc-framework-Cocoa", skip_announce=True)
     def open_device_picker(self):
         dialog = DeviceSelectionDialog(self.adb_path, self.current_target_serial, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -1123,30 +1251,56 @@ class ADBClient(QMainWindow):
     def _push_dropped_paths_default(self, local_paths):
         if local_paths:
             self.execute_tool("ADB", ["push"] + local_paths + [self.default_android_dir])
-    def _handle_promise_pull(self, remote_path, dest_path, handler):
+    def _handle_promise_pull(self, remote_path, dest_path, handler, progress):
         """Runs on the main thread (queued from AdbPromiseDelegate via
         promise_bridge) to fulfill a macOS file-promise drag by pulling the
         requested file/folder off the device to the destination Finder
-        has already allocated for us."""
+        has already allocated for us. `progress` is an NSProgress that
+        Finder watches, so it can show a real percentage on large/slow
+        transfers instead of a static "Preparing..." spinner."""
         if self.process.state() != QProcess.ProcessState.NotRunning or (self.transfer_thread and self.transfer_thread.isRunning()):
-            self.log("Drag-out failed: another transfer is already in progress.")
+            self.log("Drag-out failed: another transfer is already in progress. "
+                     "Wait for it to finish (or stop it) before dragging another file out.")
             self._call_promise_handler(handler, "Another transfer is already running.")
             return
+
+        def on_progress(percent, mb_sec, mb_trans, filename):
+            if progress is not None:
+                try:
+                    progress.setCompletedUnitCount_(min(100, max(0, int(percent))))
+                except Exception:
+                    pass
 
         def on_complete(success, message):
             try:
                 self.transfer_thread.finished_transfer.disconnect(on_complete)
             except Exception:
                 pass
+            try:
+                self.transfer_thread.progress_update.disconnect(on_progress)
+            except Exception:
+                pass
+            if progress is not None:
+                try:
+                    progress.setCompletedUnitCount_(100)
+                except Exception:
+                    pass
             if success:
+                self.log(f"Drag-out to Finder completed: {os.path.basename(dest_path)}", skip_announce=True)
                 self._call_promise_handler(handler, None)
             else:
+                # Log the FULL detail visibly in-app (the NSError message
+                # shown by Finder itself is often just a generic "The
+                # operation could not be completed" with no real detail).
+                self.log(f"Drag-out to Finder FAILED for {remote_path}:\n{message}")
                 self._call_promise_handler(handler, str(message)[:200])
 
         self.execute_internal_transfer("pull", remote_path, dest_path)
         if self.transfer_thread:
+            self.transfer_thread.progress_update.connect(on_progress)
             self.transfer_thread.finished_transfer.connect(on_complete)
         else:
+            self.log(f"Drag-out to Finder FAILED: could not start a transfer thread for {remote_path}.")
             self._call_promise_handler(handler, "Could not start transfer.")
     def _call_promise_handler(self, handler, error_message):
         if handler is None:
@@ -1160,7 +1314,7 @@ class ADBClient(QMainWindow):
             else:
                 handler(None)
         except Exception as e:
-            print(f"File Promise Completion Error: {e}")
+            self.log(f"[File Promise] Completion Error: {e}")
             try:
                 handler(None)
             except Exception:
@@ -1386,6 +1540,10 @@ class ADBClient(QMainWindow):
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setText(f"Welcome to version {APP_VERSION}!\n\n"
                     "What's New:\n"
+                    "- Fixed the cause of large drag-out failures: the fallback drag path was buffering progress text in a never-trimmed string for the whole transfer, which crawled to a halt on big files.\n"
+                    "- Outgoing macOS File Promises now show a real progress percentage in Finder on large/slow transfers.\n"
+                    "- File-promise and drag errors now show up in the Terminal Output log so they're actually visible, instead of vanishing into an invisible console print.\n"
+                    "- Startup now reports whether native macOS drag-out support loaded correctly.\n"
                     "- Fixed drag-and-drop being rejected mid-drag (a missing dragMoveEvent handler was the cause of Finder drags not registering).\n"
                     "- Fixed a thread-safety bug in outgoing macOS File Promises that could hang or crash the app.\n"
                     "- Outgoing File Promises now correctly support dragging whole folders out to Finder.\n"
@@ -1566,7 +1724,7 @@ class ADBClient(QMainWindow):
                 self.announce("File transfer failed or was cancelled.")
             self.log(f"--- Transfer Error:\n{message}\n---")
             
-            QTimer.singleShot(5000, self.hide_stats_if_idle)
+        QTimer.singleShot(5000, self.hide_stats_if_idle)
     def stop_command(self):
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self.log("Stopping process...")
