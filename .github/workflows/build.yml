@@ -38,15 +38,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller PyQt6
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            pip install pyobjc-framework-Cocoa
+          fi
+
+      - name: Verify PyObjC Imports (macOS Only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python -c "import objc; from AppKit import NSFilePromiseProvider, NSFilePromiseReceiver, NSPasteboard; from Foundation import NSOperationQueue, NSProgress; print('PyObjC OK')"
 
       - name: Execute PyInstaller Build
         shell: bash
         run: |
           if [ "$RUNNER_OS" == "macOS" ]; then
             pyinstaller --clean --windowed --name="ADB" \
-              --osx-bundle-identifier="uk.fstab.adb" adb.py
+              --osx-bundle-identifier="uk.fstab.adb" \
+              --collect-all objc \
+              --collect-all AppKit \
+              --collect-all Foundation \
+              adb.py
           else
             pyinstaller --clean --windowed --name="ADB" adb.py
+          fi
+
+      - name: Verify PyObjC Was Bundled (macOS Only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ -z "$(find dist/ADB.app -name '_objc*.so' -print -quit)" ]; then
+            echo "PyObjC is missing from the app bundle"
+            exit 1
           fi
 
       - name: Patch Info.plist and Sign (macOS Only)
