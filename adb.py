@@ -1,5 +1,6 @@
 import sys
 import os
+import ctypes
 import subprocess
 import re
 import tempfile
@@ -64,6 +65,23 @@ class _PromiseBridge(QObject):
     automatically queues delivery onto that object's event loop."""
     pull_requested = pyqtSignal(str, str, object, object)
     error_logged = pyqtSignal(str)
+
+
+class _VisibilityGroup:
+    """Shows/hides several widgets together WITHOUT wrapping them in a
+    container widget. A container widget becomes an extra 'group' in the
+    macOS accessibility tree, which VoiceOver makes the user interact into
+    before reaching the controls inside it."""
+    def __init__(self, widgets):
+        self._widgets = list(widgets)
+
+    def show(self):
+        for w in self._widgets:
+            w.show()
+
+    def hide(self):
+        for w in self._widgets:
+            w.hide()
 
 
 # --- macOS file promise *provider* (drag OUT of this app) ------------------------
@@ -139,6 +157,16 @@ _PROMISE_FORMAT_HINTS = (
     "com.apple.filepromise",
 )
 
+# Pasteboard types Qt normally accepts on its own. They are re-added whenever
+# we register the extra file-promise types so that registering can never
+# accidentally REMOVE plain Finder file-drop support.
+_BASELINE_DRAG_TYPES = (
+    "public.file-url",
+    "public.url",
+    "public.utf8-plain-text",
+    "NSFilenamesPboardType",
+)
+
 
 def _mime_has_file_promise(mime_data):
     """Best-effort check for whether a drag is carrying native macOS file
@@ -150,11 +178,66 @@ def _mime_has_file_promise(mime_data):
     try:
         formats = [f.lower() for f in mime_data.formats()]
     except Exception:
+        formats = []
+    if any(hint in fmt for fmt in formats for hint in _PROMISE_FORMAT_HINTS):
+        return True
+    # Qt does not always surface promise types through mime_data.formats(),
+    # so also ask the drag pasteboard directly.
+    try:
+        pb = NSPasteboard.pasteboardWithName_(NSPasteboardNameDrag)
+        return bool(pb.canReadObjectForClasses_options_([NSFilePromiseReceiver], None))
+    except Exception:
         return False
-    return any(hint in fmt for fmt in formats for hint in _PROMISE_FORMAT_HINTS)
 
 
-def resolve_drop_paths(mime_data, temp_dir_hint, callback):
+def register_file_promise_drop_types(widget):
+    """Qt registers its window's NSView only for the pasteboard types Qt
+    itself understands. Native file promises (Photos, Mail, Safari, ...) use
+    additional types, and a view that never registered for them never gets
+    the drag at all - dragEnterEvent is simply not called. This adds the
+    NSFilePromiseReceiver types to the window's native view.
+
+    Safe to call repeatedly. Returns (ok, detail)."""
+    if sys.platform != "darwin" or not PYOBJC_PROMISE_RECEIVER_AVAILABLE:
+        return False, "not applicable on this platform"
+    try:
+        ns_view = objc.objc_object(c_void_p=ctypes.c_void_p(int(widget.winId())))
+        promise_types = list(NSFilePromiseReceiver.readableDraggedTypes() or [])
+        try:
+            existing = list(ns_view.registeredDraggedTypes() or [])
+        except Exception:
+            existing = []
+        merged = []
+        for t in existing + list(_BASELINE_DRAG_TYPES) + promise_types:
+            if t not in merged:
+                merged.append(t)
+        ns_view.registerForDraggedTypes_(merged)
+        return True, f"registered {len(promise_types)} file promise drag types"
+    except Exception as e:
+        return False, str(e)
+
+
+def _report_drop_error(widget, message):
+    """Send a drop-related error to the visible Terminal Output log of the
+    main window (walking up the parent chain from whichever widget got the
+    drop), falling back to print() only if no window with a log exists."""
+    w = widget
+    while w is not None:
+        log_fn = getattr(w, "log", None)
+        if callable(log_fn):
+            try:
+                log_fn(message)
+                return
+            except Exception:
+                break
+        try:
+            w = w.parent()
+        except Exception:
+            break
+    print(message)
+
+
+def resolve_drop_paths(mime_data, temp_dir_hint, callback, error_callback=None):
     """
     Resolves a drop's contents into local filesystem paths, then calls
     callback(list_of_paths).
@@ -167,6 +250,9 @@ def resolve_drop_paths(mime_data, temp_dir_hint, callback):
          some browsers) - resolved asynchronously via
          NSFilePromiseReceiver; callback is invoked once the OS finishes
          writing the promised files to a temp folder.
+
+    error_callback(message), if given, is called when a file promise drop
+    fails or delivers no files, so the failure is visible to the user.
 
     Returns True if the drop was recognized and is being handled (even if
     the actual callback fires later, asynchronously), False if nothing
@@ -190,40 +276,74 @@ def resolve_drop_paths(mime_data, temp_dir_hint, callback):
             try:
                 dest_dir = tempfile.mkdtemp(prefix="adbtool_promise_", dir=temp_dir_hint)
                 dest_url = NSURL.fileURLWithPath_isDirectory_(dest_dir, True)
-            except Exception:
+            except Exception as e:
+                if error_callback is not None:
+                    error_callback(f"File promise drop failed: could not create a temporary folder ({e})")
                 return False
 
+            # The reader block is invoked once PER PROMISED FILE, and a single
+            # NSFilePromiseReceiver can promise several files. So the number of
+            # completions to wait for is the total number of file names, not the
+            # number of receivers (counting receivers made multi-file drops fire
+            # the callback early and/or more than once).
             results = []
-            remaining = [len(items)]
+            errors = []
+            counts = []
+            state = {"remaining": 0, "done": False}
+            for item in items:
+                try:
+                    n = len(item.fileNames() or [])
+                except Exception:
+                    n = 0
+                n = max(1, n)
+                counts.append(n)
+                state["remaining"] += n
+
             queue = NSOperationQueue.mainQueue()
 
             def _maybe_finish():
-                if remaining[0] <= 0 and results:
+                if state["remaining"] > 0 or state["done"]:
+                    return
+                state["done"] = True
+                if errors and error_callback is not None:
+                    error_callback("File promise drop problem: " + "; ".join(errors))
+                if results:
                     callback(results)
+                elif not errors and error_callback is not None:
+                    error_callback("File promise drop delivered no files.")
 
-            for item in items:
-                def reader(file_url, error, _res=results, _rem=remaining):
-                    if file_url is not None and error is None:
+            def _make_reader():
+                def reader(file_url, error):
+                    if error is not None:
                         try:
-                            _res.append(file_url.path())
+                            errors.append(str(error.localizedDescription()))
                         except Exception:
-                            pass
-                    _rem[0] -= 1
+                            errors.append("unknown error")
+                    elif file_url is not None:
+                        try:
+                            results.append(file_url.path())
+                        except Exception as e:
+                            errors.append(str(e))
+                    state["remaining"] -= 1
                     _maybe_finish()
+                return reader
 
+            for item, n in zip(items, counts):
                 try:
                     item.receivePromisedFilesAtDestination_options_operationQueue_reader_(
-                        dest_url, {}, queue, reader
+                        dest_url, {}, queue, _make_reader()
                     )
-                except Exception:
-                    remaining[0] -= 1
+                except Exception as e:
+                    errors.append(str(e))
+                    state["remaining"] -= n
+            _maybe_finish()
 
             return True
 
     return False
 
 
-APP_VERSION = "0.0.16-beta"
+APP_VERSION = "0.0.17-beta"
 class TerminalLineEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -241,7 +361,8 @@ class TerminalLineEdit(QLineEdit):
         else:
             super().dragMoveEvent(event)
     def dropEvent(self, event):
-        handled = resolve_drop_paths(event.mimeData(), tempfile.gettempdir(), self._insert_paths)
+        handled = resolve_drop_paths(event.mimeData(), tempfile.gettempdir(), self._insert_paths,
+                                     lambda msg: _report_drop_error(self, msg))
         if handled:
             event.acceptProposedAction()
         else:
@@ -555,6 +676,11 @@ class PreferencesDialog(QDialog):
         rn_text = QTextEdit()
         rn_text.setReadOnly(True)
         rn_text.setText(f"Version {APP_VERSION}\n"
+                        "- Main window accessibility: the section boxes and the hidden progress container that VoiceOver treated as groups have been removed. Section titles are now plain headings and every control sits directly on the page.\n"
+                        "- Fixed multi-file drops of macOS File Promises firing early or more than once. The app now waits for every promised file.\n"
+                        "- File Promise drop failures are now reported in the Terminal Output log instead of failing silently.\n"
+                        "- The window now registers for native file promise drag types, which Qt does not do on its own.\n"
+                        "- Added an accessibility debug dump (launch with ADB_A11Y_DEBUG=1) that lists the roles Qt exposes to VoiceOver.\n"
                         "- Fixed a real bug behind large drag-out failures: the old fallback drag path buffered adb's progress text in a never-trimmed string for the whole transfer, which slowed to a crawl on big files. Replaced with a byte-counted chunked pull.\n"
                         "- Outgoing macOS File Promises now publish real NSProgress so Finder shows an actual percentage on large/slow transfers instead of a static 'Preparing...' spinner.\n"
                         "- File-promise and drag errors are now written to the visible Terminal Output log instead of a console print() that a packaged app's user could never see.\n"
@@ -922,6 +1048,12 @@ class AccessibleAndroidBrowser(QDialog):
         layout.addWidget(self.cancel_btn)
         
         self.load_directory(self.current_path)
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Qt only registers its native view for the drag types it understands.
+        # Add the native file promise types (best-effort; never raises).
+        register_file_promise_drop_types(self)
+        QTimer.singleShot(500, lambda: register_file_promise_drop_types(self))
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
             event.acceptProposedAction()
@@ -931,7 +1063,8 @@ class AccessibleAndroidBrowser(QDialog):
         if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
             event.acceptProposedAction()
     def dropEvent(self, event):
-        handled = resolve_drop_paths(event.mimeData(), tempfile.gettempdir(), self._push_dropped_paths)
+        handled = resolve_drop_paths(event.mimeData(), tempfile.gettempdir(), self._push_dropped_paths,
+                                     lambda msg: _report_drop_error(self, msg))
         if handled:
             event.acceptProposedAction()
     def _push_dropped_paths(self, local_paths):
@@ -1183,6 +1316,7 @@ class ADBClient(QMainWindow):
         self.command_output_buffer = ""
         self.default_android_dir = self.settings.value("default_android_dir", "")
         self.current_target_serial = None
+        self._promise_registration_logged = False
         
         self.setWindowTitle("ADB and Fastboot Tool")
         self.setAccessibleName("ADB and Fastboot Main Window")
@@ -1202,6 +1336,8 @@ class ADBClient(QMainWindow):
         self.setup_ui()
         QTimer.singleShot(500, self.check_configuration)
         QTimer.singleShot(1500, self.check_promise_support)
+        if os.environ.get("ADB_A11Y_DEBUG"):
+            QTimer.singleShot(2500, self.dump_accessibility_tree)
     def get_current_serial(self):
         return self.current_target_serial
     def log_error_from_thread(self, message):
@@ -1216,6 +1352,22 @@ class ADBClient(QMainWindow):
             print(message)
     def _log_promise_error(self, message):
         self.log(f"[File Promise] {message}")
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Qt only registers its native view for the drag types it understands.
+        # Add the native file promise types, and re-apply once shortly after in
+        # case Qt re-registers its own types during window setup.
+        QTimer.singleShot(0, self._register_promise_drop_types)
+        QTimer.singleShot(2000, self._register_promise_drop_types)
+    def _register_promise_drop_types(self):
+        try:
+            ok, detail = register_file_promise_drop_types(self)
+            if sys.platform == "darwin" and not self._promise_registration_logged:
+                self._promise_registration_logged = True
+                state = "OK" if ok else "FAILED"
+                self.log(f"macOS file promise drop registration: {state} ({detail}).", skip_announce=True)
+        except Exception:
+            pass
     def check_promise_support(self):
         """One-time, visible diagnostic: on macOS, tell the person plainly
         whether native drag-out (file promise) support actually loaded,
@@ -1229,6 +1381,37 @@ class ADBClient(QMainWindow):
             self.log("macOS file promise support: NOT available. Falling back to a slower, "
                      "less reliable drag method - large drags may fail or appear stuck. "
                      "Install the required package with: pip install pyobjc-framework-Cocoa", skip_announce=True)
+    def dump_accessibility_tree(self):
+        """Debug aid (only runs when launched with ADB_A11Y_DEBUG=1): writes the
+        roles Qt exposes to the OS accessibility layer for this window into the
+        Terminal Output log, WITHOUT announcing them. If VoiceOver says 'group'
+        for something that shows up here as PushButton, the problem is in Qt's
+        macOS bridge rather than in this app's widget structure."""
+        if not QT_ACCESSIBILITY_AVAILABLE:
+            self.log_output.append("[A11y debug] QAccessible is not available.")
+            return
+        try:
+            lines = ["[A11y debug] Qt accessibility tree (role | name):"]
+
+            def walk(iface, depth):
+                if iface is None or depth > 12:
+                    return
+                try:
+                    role = iface.role().name
+                except Exception:
+                    role = str(iface.role())
+                try:
+                    name = iface.text(QAccessible.Text.Name)
+                except Exception:
+                    name = ""
+                lines.append(f"{'  ' * depth}{role} | {name}")
+                for i in range(iface.childCount()):
+                    walk(iface.child(i), depth + 1)
+
+            walk(QAccessible.queryAccessibleInterface(self), 0)
+            self.log_output.append("\n".join(lines))
+        except Exception as e:
+            self.log_output.append(f"[A11y debug] Could not dump accessibility tree: {e}")
     def open_device_picker(self):
         dialog = DeviceSelectionDialog(self.adb_path, self.current_target_serial, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -1245,7 +1428,8 @@ class ADBClient(QMainWindow):
         if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
             event.acceptProposedAction()
     def dropEvent(self, event):
-        handled = resolve_drop_paths(event.mimeData(), tempfile.gettempdir(), self._push_dropped_paths_default)
+        handled = resolve_drop_paths(event.mimeData(), tempfile.gettempdir(), self._push_dropped_paths_default,
+                                     lambda msg: _report_drop_error(self, msg))
         if handled:
             event.acceptProposedAction()
     def _push_dropped_paths_default(self, local_paths):
@@ -1326,17 +1510,31 @@ class ADBClient(QMainWindow):
         if QT_ACCESSIBILITY_AVAILABLE:
             self.log_output.setAccessibleDescription(message.strip())
             QAccessible.updateAccessibility(QAccessibleEvent(self.log_output, QAccessible.Event.Alert))
+    def _section_heading(self, text):
+        """A plain text heading used instead of a QGroupBox. QGroupBox (and
+        any wrapper container widget) shows up to VoiceOver as an AXGroup,
+        which has to be 'interacted with' before the controls inside it can
+        be reached. A QLabel is just text, so the controls stay directly on
+        the page."""
+        label = QLabel(text)
+        label.setStyleSheet(
+            "font-weight: bold; font-size: 14px; margin-top: 10px; "
+            "padding-bottom: 3px; border-bottom: 1px solid #666666;"
+        )
+        return label
     def setup_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(15, 15, 15, 15)
         central_widget.setLayout(main_layout)
-        # Top Controls Group
-        top_group = QGroupBox("Configuration")
-        top_layout = QVBoxLayout()
-        top_group.setLayout(top_layout)
-        
+
+        # Everything below is added straight to main_layout. No QGroupBox or
+        # wrapper QWidget containers, so the accessibility tree stays flat:
+        # window -> content -> headings, buttons, fields.
+
+        # Configuration
+        main_layout.addWidget(self._section_heading("Configuration"))
         prefs_layout = QHBoxLayout()
         self.prefs_btn = QPushButton("Preferences")
         self.prefs_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogListView))
@@ -1344,14 +1542,10 @@ class ADBClient(QMainWindow):
         self.prefs_btn.clicked.connect(self.open_preferences)
         prefs_layout.addStretch()
         prefs_layout.addWidget(self.prefs_btn)
-        top_layout.addLayout(prefs_layout)
-        
-        main_layout.addWidget(top_group)
-        # Device Manager Group
-        dev_group = QGroupBox("Device Connection")
-        dev_layout = QVBoxLayout()
-        dev_group.setLayout(dev_layout)
-        
+        main_layout.addLayout(prefs_layout)
+
+        # Device Connection
+        main_layout.addWidget(self._section_heading("Device Connection"))
         dev_inner_layout = QHBoxLayout()
         self.target_dev_label = QLabel("Target Device: Default / Any")
         self.target_dev_label.setAccessibleName("Current Target Device: Default or Any")
@@ -1364,14 +1558,10 @@ class ADBClient(QMainWindow):
         dev_inner_layout.addWidget(self.target_dev_label)
         dev_inner_layout.addWidget(self.choose_dev_btn)
         dev_inner_layout.addStretch()
-        dev_layout.addLayout(dev_inner_layout)
-        
-        main_layout.addWidget(dev_group)
-        # Transfer Group
-        transfer_group = QGroupBox("File Management")
-        transfer_layout = QVBoxLayout()
-        transfer_group.setLayout(transfer_layout)
-        
+        main_layout.addLayout(dev_inner_layout)
+
+        # File Management
+        main_layout.addWidget(self._section_heading("File Management"))
         transfer_label = QLabel("File Transfers (Or Drag and Drop file here):")
         self.wizard_btn = QPushButton("Open File Manager")
         self.wizard_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon))
@@ -1379,15 +1569,11 @@ class ADBClient(QMainWindow):
         self.wizard_btn.setAccessibleDescription("Click to open the file manager for pushing, pulling, moving, or deleting files.")
         self.wizard_btn.clicked.connect(self.start_transfer_wizard)
         
-        transfer_layout.addWidget(transfer_label)
-        transfer_layout.addWidget(self.wizard_btn)
-        
-        main_layout.addWidget(transfer_group)
-        # Terminal Group
-        term_group = QGroupBox("Command Terminal")
-        term_layout = QVBoxLayout()
-        term_group.setLayout(term_layout)
-        
+        main_layout.addWidget(transfer_label)
+        main_layout.addWidget(self.wizard_btn)
+
+        # Command Terminal
+        main_layout.addWidget(self._section_heading("Command Terminal"))
         cmd_layout = QHBoxLayout()
         self.adb_radio = QRadioButton("ADB")
         self.adb_radio.setChecked(True)
@@ -1414,14 +1600,10 @@ class ADBClient(QMainWindow):
         cmd_layout.addWidget(self.cmd_input)
         cmd_layout.addWidget(self.insert_path_btn)
         cmd_layout.addWidget(self.stop_btn)
-        
-        term_layout.addLayout(cmd_layout)
-        main_layout.addWidget(term_group)
-        # Output Group
-        out_group = QGroupBox("Terminal Output & Status")
-        out_layout = QVBoxLayout()
-        out_group.setLayout(out_layout)
-        
+        main_layout.addLayout(cmd_layout)
+
+        # Terminal Output & Status
+        main_layout.addWidget(self._section_heading("Terminal Output & Status"))
         header_layout = QHBoxLayout()
         
         self.status_label = QLabel("Status: Idle")
@@ -1436,11 +1618,7 @@ class ADBClient(QMainWindow):
         header_layout.addWidget(self.status_label)
         header_layout.addStretch()
         header_layout.addWidget(self.clear_btn)
-        out_layout.addLayout(header_layout)
-        
-        self.stats_container = QWidget()
-        self.stats_layout = QVBoxLayout(self.stats_container)
-        self.stats_layout.setContentsMargins(0, 5, 0, 10)
+        main_layout.addLayout(header_layout)
         
         self.pct_label = QLabel("Overall Progress: 0%")
         self.pct_label.setAccessibleName("Overall Progress: 0 percent")
@@ -1452,12 +1630,14 @@ class ADBClient(QMainWindow):
         self.file_label = QLabel("Current File: None")
         self.file_label.setAccessibleName("Current File: None")
         
-        self.stats_layout.addWidget(self.pct_label)
-        self.stats_layout.addWidget(self.speed_label)
-        self.stats_layout.addWidget(self.file_label)
+        main_layout.addWidget(self.pct_label)
+        main_layout.addWidget(self.speed_label)
+        main_layout.addWidget(self.file_label)
         
+        # Same show()/hide() behavior as the old stats container widget, but
+        # without an extra container (group) in the accessibility tree.
+        self.stats_container = _VisibilityGroup([self.pct_label, self.speed_label, self.file_label])
         self.stats_container.hide()
-        out_layout.addWidget(self.stats_container)
         
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
@@ -1473,8 +1653,7 @@ class ADBClient(QMainWindow):
             }
         """)
         
-        out_layout.addWidget(self.log_output)
-        main_layout.addWidget(out_group)
+        main_layout.addWidget(self.log_output)
         
         self.update_live_region_settings()
     def insert_file_path_into_terminal(self):
@@ -1540,6 +1719,9 @@ class ADBClient(QMainWindow):
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setText(f"Welcome to version {APP_VERSION}!\n\n"
                     "What's New:\n"
+                    "- Main window accessibility: removed the section boxes and hidden container that VoiceOver treated as groups. Section titles are now plain headings and every control sits directly on the page.\n"
+                    "- Fixed multi-file drops of native macOS File Promises, and failed promise drops now report an error in the Terminal Output log.\n"
+                    "- The window now registers for native file promise drag types, which Qt does not do on its own.\n"
                     "- Fixed the cause of large drag-out failures: the fallback drag path was buffering progress text in a never-trimmed string for the whole transfer, which crawled to a halt on big files.\n"
                     "- Outgoing macOS File Promises now show a real progress percentage in Finder on large/slow transfers.\n"
                     "- File-promise and drag errors now show up in the Terminal Output log so they're actually visible, instead of vanishing into an invisible console print.\n"
