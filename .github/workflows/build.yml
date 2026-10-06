@@ -9,8 +9,9 @@ permissions:
   contents: write
 
 jobs:
-  release-builds:
+  build:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -26,22 +27,52 @@ jobs:
           cache: 'pip'
 
       - name: Install System Dependencies (Linux Only)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
 
       - name: Install Python Packages
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller PyQt6
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-        shell: bash
 
       - name: Execute PyInstaller Build
-        run: |
-          pyinstaller --clean --windowed --name="ADB" adb.py
         shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            pyinstaller --clean --windowed --name="ADB" \
+              --osx-bundle-identifier="uk.fstab.adb" adb.py
+          else
+            pyinstaller --clean --windowed --name="ADB" adb.py
+          fi
+
+      - name: Patch Info.plist and Sign (macOS Only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import plistlib
+          path = "dist/ADB.app/Contents/Info.plist"
+          with open(path, "rb") as f:
+              plist = plistlib.load(f)
+          desc = "ADB needs access to save files transferred from your device."
+          plist.update({
+              "CFBundleIdentifier": "uk.fstab.adb",
+              "NSHighResolutionCapable": True,
+              "NSDesktopFolderUsageDescription": desc,
+              "NSDocumentsFolderUsageDescription": desc,
+              "NSDownloadsFolderUsageDescription": desc,
+              "NSRemovableVolumesUsageDescription": desc,
+              "NSNetworkVolumesUsageDescription": desc,
+          })
+          with open(path, "wb") as f:
+              plistlib.dump(plist, f)
+          EOF
+          codesign --force --deep --sign - dist/ADB.app
+          codesign --verify --deep --verbose=2 dist/ADB.app
 
       - name: Compress OS-Specific Target
         shell: bash
@@ -55,11 +86,28 @@ jobs:
             zip -r ../ADB-Linux.zip ADB
           fi
 
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ runner.os }}
+          path: ADB-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: release
+
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: "Latest Build"
           make_latest: true
-          files: |
-            *.zip
+          files: release/*.zip
