@@ -144,6 +144,27 @@ class _VisibilityGroup:
             w.hide()
 
 
+def _fail_promise(handler, message):
+    """Complete a file promise with an error, without touching Qt.
+
+    Kept at module level deliberately: PyObjC inspects every method defined on
+    an NSObject subclass and turns it into an Objective-C selector. A helper
+    named `_fail(self, handler, message)` is read as a zero-argument selector
+    and raises objc.BadPrototypeError while the class is being created.
+    """
+    try:
+        if PYOBJC_AVAILABLE:
+            err = NSError.errorWithDomain_code_userInfo_(
+                "com.devtools.adbclient", 1,
+                {"NSLocalizedDescriptionKey": str(message)[:200]}
+            )
+            handler(err)
+        else:
+            handler(None)
+    except Exception as e:
+        print(f"[File Promise] Could not report error to Finder: {e}")
+
+
 # --- macOS file promise *provider* (drag OUT of this app) ------------------------
 if sys.platform == "darwin" and PYOBJC_AVAILABLE:
     class AdbPromiseDelegate(NSObject):
@@ -160,20 +181,6 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
         def filePromiseProvider_fileNameForType_(self, provider, fileType):
             return self.file_name
 
-        def _fail(self, handler, message):
-            """Complete the promise with an error, without touching Qt."""
-            try:
-                if PYOBJC_AVAILABLE:
-                    err = NSError.errorWithDomain_code_userInfo_(
-                        "com.devtools.adbclient", 1,
-                        {"NSLocalizedDescriptionKey": str(message)[:200]}
-                    )
-                    handler(err)
-                else:
-                    handler(None)
-            except Exception as e:
-                print(f"[File Promise] Could not report error to Finder: {e}")
-
         def filePromiseProvider_writePromiseToURL_completionHandler_(self, provider, url, handler):
             dest_path = url.path()
 
@@ -185,7 +192,7 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
                     if not os.path.exists(dest_path):
                         open(dest_path, 'ab').close()
             except Exception as e:
-                self._fail(handler, f"Could not create the drop destination: {e}")
+                _fail_promise(handler, f"Could not create the drop destination: {e}")
                 return
 
             # Finder expects long promise-writes to publish an NSProgress so
@@ -229,7 +236,7 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
                     except Exception:
                         print(f"File Promise Handoff Error: {e}")
 
-            self._fail(handler, "The app could not start the file transfer for this drop.")
+            _fail_promise(handler, "The app could not start the file transfer for this drop.")
 
         def draggingSession_sourceOperationMaskForDraggingContext_(self, session, context):
             return NSDragOperationCopy
@@ -2347,5 +2354,4 @@ if __name__ == "__main__":
     window.raise_()
     window.activateWindow()
     
-
     sys.exit(app.exec())
