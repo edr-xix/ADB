@@ -53,6 +53,66 @@ if PYOBJC_AVAILABLE:
         PYOBJC_PROMISE_RECEIVER_AVAILABLE = False
 
 
+def _promise_uti(is_directory):
+    """The UTI a file promise must advertise. NSFilePromiseProvider requires a
+    type conforming to public.data or public.directory; using one value when
+    creating the provider and another in the delegate makes Finder reject or
+    mis-type the drop."""
+    return "public.folder" if is_directory else "public.data"
+
+
+def _qt_ns_view(widget):
+    """Return the AppKit NSView behind a Qt top-level widget, or None.
+
+    On macOS a QWidget's winId() is the pointer to its NSView. Wrapping it with
+    objc.objc_object is the only reliable way to talk to AppKit from PyQt:
+    NSApp.mainWindow() is NOT dependable in a Qt app (it is often None, or it
+    is a different window than the one the user actually dragged from)."""
+    if sys.platform != "darwin" or not PYOBJC_AVAILABLE or widget is None:
+        return None
+    try:
+        return objc.objc_object(c_void_p=ctypes.c_void_p(int(widget.winId())))
+    except Exception:
+        return None
+
+
+def _find_ancestor_with(widget, attribute):
+    """Walk a Qt widget's parent chain looking for an object with `attribute`.
+
+    Used both to find the real ADBClient window (the only object that owns
+    promise_bridge) and the file-manager dialog that owns the selection."""
+    w = widget
+    while w is not None:
+        if hasattr(w, attribute):
+            return w
+        try:
+            w = w.parent()
+        except Exception:
+            break
+    return None
+
+
+def _promise_host(widget):
+    """Locate the ADBClient instance that owns the promise bridge."""
+    return _find_ancestor_with(widget, "promise_bridge")
+
+
+def _should_accept_drag(event):
+    """Decide whether to accept a drag Enter/Move event.
+
+    Native file promises are not always described by QMimeData.formats(), and
+    Qt does not always give them hasUrls(). Because a native view is only
+    asked about pasteboard types we explicitly registered, it is safe on
+    macOS to accept anything once promise support is loaded."""
+    if event.mimeData().hasUrls():
+        return True
+    if sys.platform == "darwin" and PYOBJC_PROMISE_RECEIVER_AVAILABLE:
+        # Accept immediately rather than repeatedly sniffing the drag
+        # pasteboard on every dragMoveEvent.
+        return True
+    return _mime_has_file_promise(event.mimeData())
+
+
 class _PromiseBridge(QObject):
     """Thread-safe bridge between AppKit's background file-promise callback
     threads and the Qt GUI thread.
@@ -87,17 +147,32 @@ class _VisibilityGroup:
 # --- macOS file promise *provider* (drag OUT of this app) ------------------------
 if sys.platform == "darwin" and PYOBJC_AVAILABLE:
     class AdbPromiseDelegate(NSObject):
-        adb_cmd = objc.ivar()
-        remote_path = objc.ivar()
-        file_name = objc.ivar()
-        main_window = objc.ivar()
-        is_directory = objc.ivar()
+        # NOTE: these are deliberately plain Python attributes, not
+        # objc.ivar()s. The values include a PyQt QObject (the ADBClient host)
+        # and an Objective-C completion block; storing those in `id` ivars
+        # can hand back a different bridge object on read, which is exactly
+        # how `main_window.promise_bridge` used to disappear on the AppKit
+        # callback thread.
 
         def filePromiseProvider_fileTypeForURL_(self, provider, url):
-            return "public.folder" if self.is_directory else "public.data"
+            return _promise_uti(self.is_directory)
 
         def filePromiseProvider_fileNameForType_(self, provider, fileType):
             return self.file_name
+
+        def _fail(self, handler, message):
+            """Complete the promise with an error, without touching Qt."""
+            try:
+                if PYOBJC_AVAILABLE:
+                    err = NSError.errorWithDomain_code_userInfo_(
+                        "com.devtools.adbclient", 1,
+                        {"NSLocalizedDescriptionKey": str(message)[:200]}
+                    )
+                    handler(err)
+                else:
+                    handler(None)
+            except Exception as e:
+                print(f"[File Promise] Could not report error to Finder: {e}")
 
         def filePromiseProvider_writePromiseToURL_completionHandler_(self, provider, url, handler):
             dest_path = url.path()
@@ -109,8 +184,9 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
                 else:
                     if not os.path.exists(dest_path):
                         open(dest_path, 'ab').close()
-            except Exception:
-                pass
+            except Exception as e:
+                self._fail(handler, f"Could not create the drop destination: {e}")
+                return
 
             # Finder expects long promise-writes to publish an NSProgress so
             # it can show real percentage feedback instead of a static
@@ -122,27 +198,38 @@ if sys.platform == "darwin" and PYOBJC_AVAILABLE:
             except Exception:
                 progress = None
             self.progress = progress
-
-            # This runs on a background AppKit queue -> hand off to the main
-            # thread via the thread-safe signal bridge instead of touching
-            # Qt directly (the old QTimer.singleShot-from-background-thread
-            # approach was unsafe and the likely source of hangs/crashes).
-            if self.main_window is not None:
+            # The progress must be attached to the provider, otherwise Finder
+            # never sees it and the promise still looks stalled.
+            if progress is not None and provider is not None:
                 try:
-                    self.main_window.promise_bridge.pull_requested.emit(
+                    provider.setProgress_(progress)
+                except Exception:
+                    try:
+                        provider.progress = progress
+                    except Exception:
+                        pass
+
+            # Re-resolve the host here rather than assuming the object stored
+            # at drag-start is the main window. A DraggableItemButton lives in
+            # AccessibleAndroidBrowser (a QDialog); that dialog has no
+            # promise_bridge, so the old code silently dropped every promise
+            # and handed Finder an EMPTY file.
+            host = _promise_host(getattr(self, "main_window", None))
+            if host is None:
+                host = getattr(self, "main_window", None)
+            if host is not None and hasattr(host, "promise_bridge"):
+                try:
+                    host.promise_bridge.pull_requested.emit(
                         self.remote_path, dest_path, handler, progress
                     )
                     return
                 except Exception as e:
                     try:
-                        self.main_window.log_error_from_thread(f"File Promise Handoff Error: {e}")
+                        host.log_error_from_thread(f"File Promise Handoff Error: {e}")
                     except Exception:
                         print(f"File Promise Handoff Error: {e}")
 
-            try:
-                handler(None)
-            except Exception:
-                pass
+            self._fail(handler, "The app could not start the file transfer for this drop.")
 
         def draggingSession_sourceOperationMaskForDraggingContext_(self, session, context):
             return NSDragOperationCopy
@@ -167,6 +254,31 @@ _BASELINE_DRAG_TYPES = (
     "NSFilenamesPboardType",
 )
 
+# Root the watchdog QTimers used by incoming file promises. A parentless QTimer
+# that is only referenced by a closure cycle can be garbage-collected while it
+# is still supposed to be running.
+_ACTIVE_PROMISE_TIMERS = set()
+
+
+def _drag_pasteboards():
+    """Yield the possible native drag pasteboards. Different PyObjC/AppKit
+    versions expose NSPasteboardNameDrag under different names, so trying the
+    literal values as well avoids silently seeing an empty drag pasteboard."""
+    if sys.platform != "darwin" or not PYOBJC_PROMISE_RECEIVER_AVAILABLE:
+        return
+    names = []
+    for candidate in (globals().get("NSPasteboardNameDrag"),
+                      "com.apple.pasteboard.drag", "NSDragPboard"):
+        if candidate and candidate not in names:
+            names.append(candidate)
+    for name in names:
+        try:
+            pb = NSPasteboard.pasteboardWithName_(name)
+        except Exception:
+            continue
+        if pb is not None:
+            yield pb
+
 
 def _mime_has_file_promise(mime_data):
     """Best-effort check for whether a drag is carrying native macOS file
@@ -184,8 +296,10 @@ def _mime_has_file_promise(mime_data):
     # Qt does not always surface promise types through mime_data.formats(),
     # so also ask the drag pasteboard directly.
     try:
-        pb = NSPasteboard.pasteboardWithName_(NSPasteboardNameDrag)
-        return bool(pb.canReadObjectForClasses_options_([NSFilePromiseReceiver], None))
+        return any(
+            bool(pb.canReadObjectForClasses_options_([NSFilePromiseReceiver], None))
+            for pb in _drag_pasteboards()
+        )
     except Exception:
         return False
 
@@ -201,7 +315,9 @@ def register_file_promise_drop_types(widget):
     if sys.platform != "darwin" or not PYOBJC_PROMISE_RECEIVER_AVAILABLE:
         return False, "not applicable on this platform"
     try:
-        ns_view = objc.objc_object(c_void_p=ctypes.c_void_p(int(widget.winId())))
+        ns_view = _qt_ns_view(widget)
+        if ns_view is None:
+            return False, "could not obtain the native NSView for this window"
         promise_types = list(NSFilePromiseReceiver.readableDraggedTypes() or [])
         try:
             existing = list(ns_view.registeredDraggedTypes() or [])
@@ -266,11 +382,18 @@ def resolve_drop_paths(mime_data, temp_dir_hint, callback, error_callback=None):
             return True
 
     if sys.platform == "darwin" and PYOBJC_PROMISE_RECEIVER_AVAILABLE:
-        try:
-            pb = NSPasteboard.pasteboardWithName_(NSPasteboardNameDrag)
-            items = pb.readObjectsForClasses_options_([NSFilePromiseReceiver], None)
-        except Exception:
-            items = None
+        # Try every spelling of the drag pasteboard. Older code only tried
+        # NSPasteboardNameDrag; when that lookup returned an empty board,
+        # promise drops silently did nothing (no error, no files).
+        items = None
+        for pb in _drag_pasteboards():
+            try:
+                found = pb.readObjectsForClasses_options_([NSFilePromiseReceiver], None)
+            except Exception:
+                found = None
+            if found:
+                items = found
+                break
 
         if items:
             try:
@@ -289,7 +412,7 @@ def resolve_drop_paths(mime_data, temp_dir_hint, callback, error_callback=None):
             results = []
             errors = []
             counts = []
-            state = {"remaining": 0, "done": False}
+            state = {"remaining": 0, "done": False, "timer": None}
             for item in items:
                 try:
                     n = len(item.fileNames() or [])
@@ -305,12 +428,37 @@ def resolve_drop_paths(mime_data, temp_dir_hint, callback, error_callback=None):
                 if state["remaining"] > 0 or state["done"]:
                     return
                 state["done"] = True
+                timer = state.get("timer")
+                if timer is not None:
+                    try:
+                        timer.stop()
+                    except Exception:
+                        pass
+                    _ACTIVE_PROMISE_TIMERS.discard(timer)
                 if errors and error_callback is not None:
                     error_callback("File promise drop problem: " + "; ".join(errors))
                 if results:
                     callback(results)
                 elif not errors and error_callback is not None:
                     error_callback("File promise drop delivered no files.")
+
+            # A promise can be fulfilled by the source app much later (or never,
+            # if that app quits). A watchdog makes the failure visible instead
+            # of leaving the drop permanently "pending".
+            timer = QTimer()
+            timer.setSingleShot(True)
+            state["timer"] = timer
+
+            def _on_timeout():
+                if state["done"]:
+                    return
+                errors.append("timed out waiting for the source app to write the promised files")
+                state["remaining"] = 0
+                _maybe_finish()
+
+            timer.timeout.connect(_on_timeout)
+            _ACTIVE_PROMISE_TIMERS.add(timer)
+            timer.start(45000)
 
             def _make_reader():
                 def reader(file_url, error):
@@ -340,23 +488,34 @@ def resolve_drop_paths(mime_data, temp_dir_hint, callback, error_callback=None):
 
             return True
 
+        # Promise-looking data that we could not read is a real failure; make
+        # it visible rather than pretending the drop never happened.
+        try:
+            formats = [f.lower() for f in mime_data.formats()]
+        except Exception:
+            formats = []
+        if any(hint in fmt for fmt in formats for hint in _PROMISE_FORMAT_HINTS):
+            if error_callback is not None:
+                error_callback("A file promise was dropped, but no readable promised files were found "
+                               "on the macOS drag pasteboard.")
+
     return False
 
 
-APP_VERSION = "0.0.17-beta"
+APP_VERSION = "0.0.18-beta"
 class TerminalLineEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
+        if _should_accept_drag(event):
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
     def dragMoveEvent(self, event):
         # Qt requires the drag to be re-accepted on every move, or macOS
         # shows the "not allowed" cursor and dropEvent never fires.
-        if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
+        if _should_accept_drag(event):
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
@@ -475,68 +634,88 @@ class AdbTransferThread(QThread):
                             local_target = self.dest
                     recursive_remote_list(src, local_target)
             elif self.action in ["android_move", "android_copy"]:
-                src = self.src_list[0].replace('//', '/') if self.src_list[0].startswith('//') else self.src_list[0]
+                # Multiple selected items are copied/moved one after another in
+                # the same thread so progress stays on a single progress bar.
                 dest = self.dest
-                
-                fi = device.sync.stat(src)
-                if fi.mode == 0:
-                    raise Exception(f"Source not found: {src}")
-                
-                if self.action == "android_copy":
-                    if stat.S_ISDIR(fi.mode):
-                        res = device.shell(["du", "-sk", src])
-                        match = re.search(r'^(\d+)', res.strip())
-                        if match:
-                            total_bytes = int(match.group(1)) * 1024
-                    else:
-                        total_bytes = fi.size
-                        
                 start_time = time.time()
-                fname = os.path.basename(src)
-                
-                if self.action == "android_move":
-                    device.shell(["mv", src, dest])
-                    self.progress_update.emit(100, 0, 0, fname)
-                else:
-                    cmd_list = [self.adb_path]
-                    if self.serial:
-                        cmd_list.extend(["-s", self.serial])
-                    cmd_list.extend(["shell", "cp", "-a", src, dest])
-                    
-                    proc = subprocess.Popen(cmd_list)
-                    dest_path = f"{dest.rstrip('/')}/{fname}" if device.sync.stat(dest).mode & stat.S_IFDIR else dest
-                    
-                    while proc.poll() is None:
-                        if self.is_cancelled:
-                            proc.kill()
-                            raise InterruptedError("Cancelled")
-                        
+                sources = []
+                for raw_src in self.src_list:
+                    src = raw_src.replace('//', '/') if raw_src.startswith('//') else raw_src
+                    fi = device.sync.stat(src)
+                    if fi.mode == 0:
+                        raise Exception(f"Source not found: {src}")
+                    size = fi.size
+                    if self.action == "android_copy" and stat.S_ISDIR(fi.mode):
                         try:
-                            fi_dest = device.sync.stat(dest_path)
-                            if stat.S_ISDIR(fi_dest.mode):
-                                res = device.shell(["du", "-sk", dest_path])
-                                match = re.search(r'^(\d+)', res.strip())
-                                if match:
-                                    current_bytes = int(match.group(1)) * 1024
-                                else:
-                                    current_bytes = 0
-                            else:
-                                current_bytes = fi_dest.size
-                            
-                            percent = int((current_bytes / total_bytes) * 100) if total_bytes > 0 else 0
-                            percent = min(100, percent)
-                            elapsed = time.time() - start_time
-                            mb_trans = current_bytes / (1024 * 1024)
-                            mb_sec = mb_trans / elapsed if elapsed > 0 else 0
-                            
-                            self.progress_update.emit(percent, mb_sec, mb_trans, fname)
+                            res = device.shell(["du", "-sk", src])
+                            match = re.search(r'^(\d+)', res.strip())
+                            if match:
+                                size = int(match.group(1)) * 1024
                         except Exception:
                             pass
-                        time.sleep(1)
-                        
-                    if proc.returncode != 0:
-                        raise Exception("Internal copy failed.")
-                
+                    sources.append((src, size, os.path.basename(src.rstrip('/'))))
+                    total_bytes += size
+
+                if self.action == "android_move":
+                    for src, size, fname in sources:
+                        if self.is_cancelled:
+                            self.finished_transfer.emit(False, "Transfer cancelled by user.")
+                            return
+                        device.shell(["mv", src, dest])
+                        self.progress_update.emit(100, 0, 0, fname)
+                else:
+                    dest_is_dir = False
+                    try:
+                        dest_is_dir = bool(device.sync.stat(dest).mode & stat.S_IFDIR)
+                    except Exception:
+                        pass
+                    bytes_done = 0
+                    for src, size, fname in sources:
+                        if self.is_cancelled:
+                            self.finished_transfer.emit(False, "Transfer cancelled by user.")
+                            return
+                        cmd_list = [self.adb_path]
+                        if self.serial:
+                            cmd_list.extend(["-s", self.serial])
+                        cmd_list.extend(["shell", "cp", "-a", src, dest])
+
+                        proc = subprocess.Popen(cmd_list)
+                        dest_path = f"{dest.rstrip('/')}/{fname}" if dest_is_dir else dest
+
+                        while proc.poll() is None:
+                            if self.is_cancelled:
+                                proc.kill()
+                                self.finished_transfer.emit(False, "Transfer cancelled by user.")
+                                return
+
+                            try:
+                                fi_dest = device.sync.stat(dest_path)
+                                if stat.S_ISDIR(fi_dest.mode):
+                                    res = device.shell(["du", "-sk", dest_path])
+                                    match = re.search(r'^(\d+)', res.strip())
+                                    current_bytes = int(match.group(1)) * 1024 if match else 0
+                                else:
+                                    current_bytes = fi_dest.size
+                                current_bytes = min(current_bytes, size)
+
+                                done = bytes_done + current_bytes
+                                percent = int(done / total_bytes * 100) if total_bytes > 0 else 0
+                                percent = min(100, percent)
+                                elapsed = time.time() - start_time
+                                mb_trans = done / (1024 * 1024)
+                                mb_sec = mb_trans / elapsed if elapsed > 0 else 0
+
+                                self.progress_update.emit(percent, mb_sec, mb_trans, fname)
+                            except Exception:
+                                pass
+                            time.sleep(1)
+
+                        if proc.returncode != 0:
+                            raise Exception("Internal copy failed.")
+                        bytes_done += size
+                        pct = min(100, int(bytes_done / total_bytes * 100)) if total_bytes else 100
+                        self.progress_update.emit(pct, 0, 0, fname)
+
                 self.finished_transfer.emit(True, "File transfer completed successfully.")
                 return
             if total_bytes == 0 and len(transfer_list) == 0:
@@ -676,6 +855,9 @@ class PreferencesDialog(QDialog):
         rn_text = QTextEdit()
         rn_text.setReadOnly(True)
         rn_text.setText(f"Version {APP_VERSION}\n"
+                        "- File Manager now supports multi-select: Control/Command-click to add items, or use Select All / Clear Selection. Copy, Move, Delete, and drag-out all operate on the whole selection.\n"
+                        "- Fixed macOS File Promises: drag-out now finds the real main window instead of the file-manager dialog (the old path silently produced empty files), starts the native drag from the correct NSView, advertises the right folder/file type, and completes Finder's promise reliably.\n"
+                        "- Incoming File Promise drops now try every drag pasteboard name, report failures visibly, and time out instead of hanging forever.\n"
                         "- Main window accessibility: the section boxes and the hidden progress container that VoiceOver treated as groups have been removed. Section titles are now plain headings and every control sits directly on the page.\n"
                         "- Fixed multi-file drops of macOS File Promises firing early or more than once. The app now waits for every promised file.\n"
                         "- File Promise drop failures are now reported in the Terminal Output log instead of failing silently.\n"
@@ -836,51 +1018,76 @@ class DraggableItemButton(QPushButton):
             return
 
         main_win = self.window()
+        host = _promise_host(self)
+
+        # If this button is part of a multi-selection, drag every selected
+        # item, not just the one that happened to receive the mouse-down.
+        browser = _find_ancestor_with(self, "selected_targets")
+        targets = browser.selected_targets() if browser is not None else []
+        normalized_remote = self.remote_path.rstrip('/')
+        if normalized_remote not in [path.rstrip('/') for path, _ in targets]:
+            targets = [(self.remote_path, self.is_dir)]
+
+        def report_error(message):
+            if host is not None and hasattr(host, "log_error_from_thread"):
+                host.log_error_from_thread(message)
+            else:
+                print(message)
 
         if sys.platform == "darwin" and PYOBJC_AVAILABLE:
             try:
-                self._mac_delegate = AdbPromiseDelegate.alloc().init()
-                self._mac_delegate.adb_cmd = self.adb_cmd
-                self._mac_delegate.remote_path = self.remote_path
-                self._mac_delegate.file_name = os.path.basename(self.remote_path.rstrip('/'))
-                self._mac_delegate.is_directory = self.is_dir
-                self._mac_delegate.main_window = main_win
-                
-                self._mac_provider = NSFilePromiseProvider.alloc().initWithFileType_delegate_("public.data", self._mac_delegate)
-                self._mac_drag_item = NSDraggingItem.alloc().initWithPasteboardWriter_(self._mac_provider)
-                
-                img = NSImage.alloc().initWithSize_(NSSize(32, 32))
-                self._mac_drag_item.setDraggingFrame_contents_( ((0,0),(32,32)), img )
-                
-                ns_view = NSApp.mainWindow().contentView() if NSApp.mainWindow() else None
+                delegates = []
+                providers = []
+                drag_items = []
+                for remote_path, is_directory in targets:
+                    delegate = AdbPromiseDelegate.alloc().init()
+                    delegate.adb_cmd = self.adb_cmd
+                    delegate.remote_path = remote_path
+                    delegate.file_name = os.path.basename(remote_path.rstrip('/'))
+                    delegate.is_directory = is_directory
+                    # Store the ADBClient, not the file-manager dialog: the
+                    # dialog has no promise_bridge.
+                    delegate.main_window = host or main_win
+
+                    uti = _promise_uti(is_directory)
+                    provider = NSFilePromiseProvider.alloc().initWithFileType_delegate_(uti, delegate)
+                    item = NSDraggingItem.alloc().initWithPasteboardWriter_(provider)
+                    img = NSImage.alloc().initWithSize_(NSSize(32, 32))
+                    item.setDraggingFrame_contents_(((0, 0), (32, 32)), img)
+                    delegates.append(delegate)
+                    providers.append(provider)
+                    drag_items.append(item)
+
+                # Keep strong references alive for the whole drag session.
+                self._mac_delegates = delegates
+                self._mac_providers = providers
+                self._mac_drag_items = drag_items
+
+                # Do NOT use NSApp.mainWindow() here: in a Qt app it is often
+                # None or points at a different window. Use the NSView behind
+                # the window the button actually belongs to.
+                ns_view = _qt_ns_view(main_win)
                 mac_event = getattr(self, '_mac_press_event', None) or NSApp.currentEvent()
-                
-                if ns_view and mac_event:
-                    ns_view.beginDraggingSessionWithItems_event_source_([self._mac_drag_item], mac_event, self._mac_delegate)
-                    return 
+                if ns_view is None:
+                    raise RuntimeError("no native NSView for the file manager window")
+                if mac_event is None:
+                    raise RuntimeError("no native mouse-down event for this drag")
+
+                ns_view.beginDraggingSessionWithItems_event_source_(drag_items, mac_event, delegates[0])
+                return
             except Exception as e:
-                if main_win is not None and hasattr(main_win, "log_error_from_thread"):
-                    main_win.log_error_from_thread(f"Native drag-out failed to start ({e}); falling back to a slower method.")
-                else:
-                    print(f"File Promise Event Error: {e}")
+                report_error(f"Native drag-out failed to start ({e}); falling back to a slower method.")
             # fall through to the generic fallback below rather than just
             # silently returning and doing nothing.
 
-        self._run_fallback_drag(main_win)
+        self._run_fallback_drag(main_win, targets)
 
     def _estimate_remote_size(self):
         """Quick stat call so we can show real percentages and warn about
         very large items before committing to a blocking pull."""
-        subprocess.run([self.adb_cmd[0], "start-server"], check=False)
-        client = adbutils.AdbClient(host="127.0.0.1", port=5037)
-        serial = None
-        if "-s" in self.adb_cmd:
-            idx = self.adb_cmd.index("-s")
-            serial = self.adb_cmd[idx + 1]
-        device = client.device(serial) if serial else client.device()
-        return device.sync.stat(self.remote_path).size
+        return self._estimate_remote_size_for(self.remote_path)
 
-    def _pull_for_drag(self, local_dest, size_bytes):
+    def _pull_for_drag(self, remote_path, local_dest, size_bytes):
         """Chunked pull using adbutils directly, tracking raw byte counts.
 
         The previous implementation shelled out to `adb pull -p` and
@@ -904,7 +1111,7 @@ class DraggableItemButton(QPushButton):
         bytes_done = 0
         last_ui_update = 0.0
         with open(local_dest, 'wb') as f:
-            for chunk in device.sync.iter_content(self.remote_path):
+            for chunk in device.sync.iter_content(remote_path):
                 f.write(chunk)
                 bytes_done += len(chunk)
                 now = time.time()
@@ -918,7 +1125,17 @@ class DraggableItemButton(QPushButton):
                     QApplication.processEvents()
         return True
 
-    def _run_fallback_drag(self, main_win):
+    def _estimate_remote_size_for(self, remote_path):
+        subprocess.run([self.adb_cmd[0], "start-server"], check=False)
+        client = adbutils.AdbClient(host="127.0.0.1", port=5037)
+        serial = None
+        if "-s" in self.adb_cmd:
+            idx = self.adb_cmd.index("-s")
+            serial = self.adb_cmd[idx + 1]
+        device = client.device(serial) if serial else client.device()
+        return device.sync.stat(remote_path).size
+
+    def _run_fallback_drag(self, main_win, targets=None):
         """Generic (non-macOS-promise) drag-out: the file has to be fully
         downloaded locally before Qt's QDrag can start, which means
         holding the mouse button down for the whole pull. There is no
@@ -926,20 +1143,25 @@ class DraggableItemButton(QPushButton):
         Windows/Linux, so for very large items we warn up front and
         point at the non-drag 'Copy to Computer' action instead, rather
         than let it silently struggle."""
+        targets = targets or [(self.remote_path, self.is_dir)]
         original_text = self.text()
-        try:
-            size_bytes = self._estimate_remote_size()
-        except Exception:
-            size_bytes = None
+        file_targets = [(p, d) for p, d in targets if not d]
+        skipped_dirs = [p for p, d in targets if d]
+
+        sizes = {}
+        for path, _ in file_targets:
+            try:
+                sizes[path] = self._estimate_remote_size_for(path)
+            except Exception:
+                sizes[path] = None
 
         LARGE_THRESHOLD = 500 * 1024 * 1024  # 500 MB
-        if size_bytes and size_bytes > LARGE_THRESHOLD:
-            size_gb = size_bytes / (1024 ** 3)
+        if any(size and size > LARGE_THRESHOLD for size in sizes.values()):
             proceed = QMessageBox.question(
                 self, "Large File",
-                f"This item is about {size_gb:.1f} GB. Dragging it out has to fully "
-                "download it first, and the mouse button has to stay held down the "
-                "whole time - for large files this is slow and easy to interrupt by "
+                "One or more selected items are very large. Dragging them out has to "
+                "fully download them first, and the mouse button has to stay held down "
+                "the whole time - for large files this is slow and easy to interrupt by "
                 "accident.\n\n"
                 "For large files, the item menu's 'Copy to Computer' action is much "
                 "more reliable.\n\nContinue with the drag anyway?",
@@ -949,34 +1171,44 @@ class DraggableItemButton(QPushButton):
             if proceed != QMessageBox.StandardButton.Yes:
                 return
 
+        if skipped_dirs:
+            QMessageBox.information(
+                self, "Folders Cannot Be Dragged Here",
+                "Native drag support is unavailable, so folders cannot be dragged out "
+                "with this method. Use the item menu's 'Copy to Computer' action for them."
+            )
+        if not file_targets:
+            return
+
         self.setText("Preparing...")
         self.setEnabled(False)
         QApplication.processEvents()
 
         temp_dir = tempfile.gettempdir()
-        base_name = os.path.basename(self.remote_path.rstrip('/'))
-        local_dest = os.path.join(temp_dir, base_name)
-
-        success = False
+        local_paths = []
         error_message = None
         try:
-            success = self._pull_for_drag(local_dest, size_bytes)
+            for path, _ in file_targets:
+                base_name = os.path.basename(path.rstrip('/')) or "file"
+                local_dest = os.path.join(temp_dir, base_name)
+                self._pull_for_drag(path, local_dest, sizes.get(path))
+                if os.path.exists(local_dest):
+                    local_paths.append(local_dest)
         except Exception as e:
             error_message = f"{e}\n\n{traceback.format_exc()}"
-            success = False
 
         self.setText(original_text)
         self.setEnabled(True)
 
-        if success and os.path.exists(local_dest):
+        if local_paths:
             drag = QDrag(self)
             mime = QMimeData()
-            mime.setUrls([QUrl.fromLocalFile(local_dest)])
+            mime.setUrls([QUrl.fromLocalFile(p) for p in local_paths])
             drag.setMimeData(mime)
             drag.exec(Qt.DropAction.CopyAction)
         else:
-            msg = f"Could not prepare '{base_name}' for dragging."
-            if main_win is not None:
+            msg = "Could not prepare the selected items for dragging."
+            if main_win is not None and hasattr(main_win, "log"):
                 main_win.log(f"Drag-out failed: {msg}\n{error_message or ''}")
             QMessageBox.warning(self, "Drag Failed", msg + (f"\n\n{error_message}" if error_message else ""))
 class AccessibleAndroidBrowser(QDialog):
@@ -990,8 +1222,11 @@ class AccessibleAndroidBrowser(QDialog):
             
         self.mode = mode 
         self.current_path = start_path if start_path.endswith('/') else start_path + '/'
-        self.selected_item_name = None
-        self.selected_item_is_dir = False
+        # Multi-selection. Names are relative to current_path so the selection
+        # is invalidated naturally whenever the folder changes.
+        self.selected_names = []
+        self.selected_is_dir = {}
+        self.selected_path = None
         self.current_items = []
         self.item_buttons = []
         
@@ -1006,7 +1241,8 @@ class AccessibleAndroidBrowser(QDialog):
         
         self.path_label = QLabel(f"Current Directory: {self.current_path}")
         top_layout.addWidget(self.path_label)
-        self.selected_label = QLabel("Selected: None")
+        self.selected_label = QLabel("Selected: None (actions apply to the current folder)")
+        self.selected_label.setAccessibleName("No items selected; actions apply to the current folder")
         self.selected_label.setStyleSheet("font-weight: bold; color: #FFA500;")
         top_layout.addWidget(self.selected_label)
         
@@ -1019,11 +1255,23 @@ class AccessibleAndroidBrowser(QDialog):
         action_layout.addWidget(self.up_btn)
         self.menu_btn = QPushButton("Menu")
         self.menu_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMenuButton))
-        self.menu_btn.setAccessibleName("Open Menu for selected item or current folder")
+        self.menu_btn.setAccessibleName("Open Menu for selected items or current folder")
+        self.menu_btn.setAccessibleDescription("Copy, move, or delete every selected item at once.")
         self.menu_btn.clicked.connect(self.open_menu)
         action_layout.addWidget(self.menu_btn)
-        
+
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.setAccessibleName("Select All Items in This Folder")
+        self.select_all_btn.clicked.connect(self.select_all)
+        action_layout.addWidget(self.select_all_btn)
+        self.clear_selection_btn = QPushButton("Clear Selection")
+        self.clear_selection_btn.setAccessibleName("Clear Selection")
+        self.clear_selection_btn.clicked.connect(self.clear_selection)
+        action_layout.addWidget(self.clear_selection_btn)
+
         if self.mode == "select_dir":
+            self.select_all_btn.hide()
+            self.clear_selection_btn.hide()
             self.select_dir_btn = QPushButton("SELECT THIS DIRECTORY")
             self.select_dir_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOkButton))
             self.select_dir_btn.setAccessibleName("Confirm and select this entire directory")
@@ -1055,12 +1303,12 @@ class AccessibleAndroidBrowser(QDialog):
         register_file_promise_drop_types(self)
         QTimer.singleShot(500, lambda: register_file_promise_drop_types(self))
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
+        if _should_accept_drag(event):
             event.acceptProposedAction()
     def dragMoveEvent(self, event):
         # Required or macOS will show a "not allowed" cursor and dropEvent
         # will never fire, even though dragEnterEvent accepted the drag.
-        if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
+        if _should_accept_drag(event):
             event.acceptProposedAction()
     def dropEvent(self, event):
         handled = resolve_drop_paths(event.mimeData(), tempfile.gettempdir(), self._push_dropped_paths,
@@ -1070,6 +1318,69 @@ class AccessibleAndroidBrowser(QDialog):
     def _push_dropped_paths(self, local_paths):
         if local_paths and self.parent():
             self.parent().execute_tool("ADB", ["push"] + local_paths + [self.current_path])
+
+    # --- Multi-selection -------------------------------------------------------
+    def selected_targets(self):
+        """Return [(remote_path, is_directory), ...] for all selected items.
+
+        With no selection the current folder itself is the target, which is
+        what the existing menu actions did before multi-select existed."""
+        if self.selected_names:
+            return [(f"{self.current_path}{name}", self.selected_is_dir.get(name, False))
+                    for name in self.selected_names]
+        return [(self.current_path, True)]
+
+    def selected_paths(self):
+        return [path for path, _ in self.selected_targets()]
+
+    def _reset_selection(self):
+        self.selected_names = []
+        self.selected_is_dir = {}
+        self._update_selection_display()
+
+    def _update_selection_display(self):
+        count = len(self.selected_names)
+        if count == 0:
+            text = "Selected: None (actions apply to the current folder)"
+        elif count == 1:
+            text = f"Selected: {self.selected_names[0]}"
+        else:
+            text = f"Selected: {count} items"
+        self.selected_label.setText(text)
+        self.selected_label.setAccessibleName(text)
+        for btn in self.item_buttons:
+            name = getattr(btn, "_item_name", None)
+            selected = name in self.selected_names
+            btn.setStyleSheet("background-color: #005599; color: white;" if selected else "")
+            state = "Selected." if selected else "Not selected."
+            btn.setAccessibleDescription(state + " Control-click or Command-click to add this item to a multi-selection.")
+
+    def _set_single_selection(self, name, is_dir):
+        self.selected_names = [name]
+        self.selected_is_dir = {name: is_dir}
+        self._update_selection_display()
+
+    def _toggle_selection(self, name, is_dir):
+        if name in self.selected_names:
+            self.selected_names.remove(name)
+            self.selected_is_dir.pop(name, None)
+        else:
+            self.selected_names.append(name)
+            self.selected_is_dir[name] = is_dir
+        self._update_selection_display()
+
+    def select_all(self):
+        if self.mode == "select_dir":
+            return
+        self.selected_names = list(self.current_items)
+        self.selected_is_dir = {name: getattr(btn, "_item_is_dir", False)
+                                for btn in self.item_buttons
+                                for name in [getattr(btn, "_item_name", None)] if name}
+        self._update_selection_display()
+
+    def clear_selection(self):
+        self._reset_selection()
+
     def go_up(self):
         if self.current_path != "/":
             parent = os.path.dirname(self.current_path.rstrip('/'))
@@ -1081,32 +1392,49 @@ class AccessibleAndroidBrowser(QDialog):
     def open_menu(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("File Manager Menu")
+        dialog.setAccessibleName("File Manager Action Menu")
         layout = QVBoxLayout(dialog)
-        if self.selected_item_name:
-            target_name = self.selected_item_name
-            target_path = f"{self.current_path}{self.selected_item_name}"
+
+        targets = self.selected_paths()
+        count = len(targets)
+        if self.selected_names:
+            target_name = ", ".join(self.selected_names)
+            if len(target_name) > 90:
+                target_name = target_name[:87] + "..."
         else:
             target_name = "Current Folder"
-            target_path = self.current_path
-        item_lbl = QLabel(f"Target: {target_name}")
+
+        item_lbl = QLabel(f"Target ({count}): {target_name}")
         item_lbl.setStyleSheet("font-weight: bold;")
         layout.addWidget(item_lbl)
+
+        # Selection controls are here too so a keyboard/screen-reader user can
+        # build a multi-selection without needing modifier-key mouse clicks.
+        sel_layout = QHBoxLayout()
+        btn_all = QPushButton("Select All Items")
+        btn_all.clicked.connect(lambda: [self.select_all(), dialog.accept()])
+        sel_layout.addWidget(btn_all)
+        btn_none = QPushButton("Clear Selection")
+        btn_none.clicked.connect(lambda: [self.clear_selection(), dialog.accept()])
+        sel_layout.addWidget(btn_none)
+        layout.addLayout(sel_layout)
+
         btn_copy_mac = QPushButton("Copy to Computer")
-        btn_copy_mac.clicked.connect(lambda: [dialog.accept(), self.action_pull(target_path, move=False)])
+        btn_copy_mac.clicked.connect(lambda: [dialog.accept(), self.action_pull(targets, move=False)])
         layout.addWidget(btn_copy_mac)
         btn_move_mac = QPushButton("Move to Computer")
-        btn_move_mac.clicked.connect(lambda: [dialog.accept(), self.action_pull(target_path, move=True)])
+        btn_move_mac.clicked.connect(lambda: [dialog.accept(), self.action_pull(targets, move=True)])
         layout.addWidget(btn_move_mac)
         btn_copy_and = QPushButton("Copy file or folder within Android")
-        btn_copy_and.clicked.connect(lambda: [dialog.accept(), self.action_copy(target_path)])
+        btn_copy_and.clicked.connect(lambda: [dialog.accept(), self.action_copy(targets)])
         layout.addWidget(btn_copy_and)
         btn_move_and = QPushButton("Move file or folder within Android")
-        btn_move_and.clicked.connect(lambda: [dialog.accept(), self.action_move(target_path)])
+        btn_move_and.clicked.connect(lambda: [dialog.accept(), self.action_move(targets)])
         layout.addWidget(btn_move_and)
-        del_text = "Delete selected folder" if self.selected_item_is_dir else "Delete selected file"
+        del_text = f"Delete selected {'items' if count > 1 else 'item'}"
         btn_delete = QPushButton(del_text)
         btn_delete.setStyleSheet("color: red;")
-        btn_delete.clicked.connect(lambda: [dialog.accept(), self.action_delete(target_path)])
+        btn_delete.clicked.connect(lambda: [dialog.accept(), self.action_delete(targets)])
         layout.addWidget(btn_delete)
         layout.addWidget(QLabel("Global Actions:"))
         btn_push_mac = QPushButton("Push File/Folder from Computer")
@@ -1146,38 +1474,50 @@ class AccessibleAndroidBrowser(QDialog):
             cmd = self.adb_cmd + ["shell", "mkdir", shlex.quote(new_dir)]
             subprocess.run(cmd)
             self.load_directory(self.current_path)
-    def action_delete(self, target_path):
-        reply = QMessageBox.warning(self, "Confirm Delete", 
-                                    f"Are you sure you want to PERMANENTLY delete:\n\n{target_path}\n\nThis cannot be undone.", 
+    def action_delete(self, targets):
+        targets = targets if isinstance(targets, (list, tuple)) else [targets]
+        listing = "\n".join(f"  - {p}" for p in targets)
+        reply = QMessageBox.warning(self, "Confirm Delete",
+                                    f"Are you sure you want to PERMANENTLY delete {len(targets)} item(s)?\n\n{listing}\n\nThis cannot be undone.",
                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                                    
+
         if reply == QMessageBox.StandardButton.Yes:
-            subprocess.run(self.adb_cmd + ["shell", "rm", "-rf", shlex.quote(target_path)])
-            if target_path == self.current_path:
+            for target_path in targets:
+                # adb shell joins its arguments and the device shell parses
+                # them again, so shlex.quote is correct here.
+                subprocess.run(self.adb_cmd + ["shell", "rm", "-rf", shlex.quote(target_path)])
+            if self.current_path in targets:
                 self.go_up()
             else:
+                self._reset_selection()
                 self.load_directory(self.current_path)
-        
-    def action_pull(self, target_path, move=False):
+
+    def action_pull(self, targets, move=False):
         local_dest = QFileDialog.getExistingDirectory(self, "Select Save Destination")
         if local_dest:
-            if self.parent():
+            host = _promise_host(self) or self.parent()
+            if host and hasattr(host, "execute_internal_transfer"):
                 action = "move_to_mac" if move else "pull"
-                self.parent().execute_internal_transfer(action, target_path, local_dest)
+                target_list = list(targets) if isinstance(targets, (list, tuple)) else [targets]
+                host.execute_internal_transfer(action, target_list, local_dest)
             self.accept()
-    def action_move(self, target_path):
-        target_name = os.path.basename(target_path.rstrip('/')) or "Current Folder"
-        dest, ok = QInputDialog.getText(self, "Destination", f"Enter destination path for {target_name}:", text=self.current_path)
+
+    def action_move(self, targets):
+        self._internal_copy_or_move("android_move", targets)
+
+    def action_copy(self, targets):
+        self._internal_copy_or_move("android_copy", targets)
+
+    def _internal_copy_or_move(self, action, targets):
+        target_list = list(targets) if isinstance(targets, (list, tuple)) else [targets]
+        label = os.path.basename(target_list[0].rstrip('/')) or "Current Folder"
+        if len(target_list) > 1:
+            label += f" and {len(target_list) - 1} more"
+        dest, ok = QInputDialog.getText(self, "Destination", f"Enter destination path for {label}:", text=self.current_path)
         if ok and dest.strip():
-            if self.parent():
-                self.parent().execute_internal_transfer("android_move", target_path, dest.strip())
-            self.accept()
-    def action_copy(self, target_path):
-        target_name = os.path.basename(target_path.rstrip('/')) or "Current Folder"
-        dest, ok = QInputDialog.getText(self, "Destination", f"Enter destination path for {target_name}:", text=self.current_path)
-        if ok and dest.strip():
-            if self.parent():
-                self.parent().execute_internal_transfer("android_copy", target_path, dest.strip())
+            host = _promise_host(self) or self.parent()
+            if host and hasattr(host, "execute_internal_transfer"):
+                host.execute_internal_transfer(action, target_list, dest.strip())
             self.accept()
     def select_current_directory(self):
         self.selected_path = self.current_path
@@ -1185,10 +1525,7 @@ class AccessibleAndroidBrowser(QDialog):
     def load_directory(self, path):
         self.current_path = path
         self.path_label.setText(f"Current Directory: {self.current_path}")
-        self.selected_item_name = None
-        self.selected_item_is_dir = False
-        self.selected_label.setText("Selected: None")
-        self.selected_label.setAccessibleName("Selected item: None")
+        self._reset_selection()
         self.current_items.clear()
         self.item_buttons.clear()
         
@@ -1245,10 +1582,13 @@ class AccessibleAndroidBrowser(QDialog):
                     item_remote_path += "/"
                     
                 btn = DraggableItemButton(btn_text, self.adb_cmd, item_remote_path, is_dir)
+                btn._item_name = name
+                btn._item_is_dir = is_dir
                 
                 type_str = "Folder" if is_dir else "File"
                 acc_name = f"{type_str}: {name}, Size: {size_str}" if size_str else f"{type_str}: {name}"
                 btn.setAccessibleName(acc_name)
+                btn.setAccessibleDescription("Control-click or Command-click to add this item to a multi-selection.")
                 
                 if is_dir:
                     btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
@@ -1272,26 +1612,26 @@ class AccessibleAndroidBrowser(QDialog):
             else:
                 QMessageBox.information(self, "Invalid Selection", "You are looking for a directory. Please navigate to the correct folder and click the 'SELECT THIS DIRECTORY' button.")
             return
-        self.selected_item_name = name
-        self.selected_item_is_dir = is_dir
-        self.selected_label.setText(f"Selected: {name}")
-        self.selected_label.setAccessibleName(f"Selected item: {name}")
-        
-        for b in self.item_buttons:
-            b.setStyleSheet("")
-        btn.setStyleSheet("background-color: #005599; color: white;")
-        if is_dir:
+
+        modifiers = QApplication.keyboardModifiers()
+        multi = bool(modifiers & (Qt.KeyboardModifier.ControlModifier |
+                                  Qt.KeyboardModifier.MetaModifier))
+        if is_dir and not multi:
+            # Preserve the original single-click navigation for folders.
             self.load_directory(f"{self.current_path}{name}/")
+            return
+        if multi:
+            self._toggle_selection(name, is_dir)
+        else:
+            self._set_single_selection(name, is_dir)
+
     def on_item_context_menu(self, name, is_dir, btn):
-        self.selected_item_name = name
-        self.selected_item_is_dir = is_dir
-        self.selected_label.setText(f"Selected: {name}")
-        self.selected_label.setAccessibleName(f"Selected item: {name}")
-        
-        for b in self.item_buttons:
-            b.setStyleSheet("")
-        btn.setStyleSheet("background-color: #005599; color: white;")
-        
+        # Right-clicking an already selected item keeps the whole selection so
+        # the menu can act on all of it at once.
+        if name not in self.selected_names:
+            self._set_single_selection(name, is_dir)
+        else:
+            self._update_selection_display()
         self.open_menu()
 class ADBClient(QMainWindow):
     def __init__(self):
@@ -1332,6 +1672,11 @@ class ADBClient(QMainWindow):
         self.promise_bridge = _PromiseBridge()
         self.promise_bridge.pull_requested.connect(self._handle_promise_pull)
         self.promise_bridge.error_logged.connect(self._log_promise_error)
+        # Finder can deliver one writePromise callback per dragged item at
+        # almost the same instant. Only one transfer can run at a time, so the
+        # rest wait here instead of being failed with "another transfer is
+        # already running".
+        self._promise_queue = []
         
         self.setup_ui()
         QTimer.singleShot(500, self.check_configuration)
@@ -1376,7 +1721,9 @@ class ADBClient(QMainWindow):
         if sys.platform != "darwin":
             return
         if PYOBJC_AVAILABLE:
-            self.log("macOS file promise support: available (native drag-out enabled).", skip_announce=True)
+            receiver = "available" if PYOBJC_PROMISE_RECEIVER_AVAILABLE else "NOT available"
+            self.log(f"macOS file promise support: drag-out available; drag-in {receiver}.",
+                     skip_announce=True)
         else:
             self.log("macOS file promise support: NOT available. Falling back to a slower, "
                      "less reliable drag method - large drags may fail or appear stuck. "
@@ -1420,12 +1767,12 @@ class ADBClient(QMainWindow):
             self.target_dev_label.setText(f"Target Device: {display_name}")
             self.target_dev_label.setAccessibleName(f"Current Target Device: {display_name}")
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
+        if _should_accept_drag(event):
             event.acceptProposedAction()
     def dragMoveEvent(self, event):
         # Required or macOS will show a "not allowed" cursor and dropEvent
         # will never fire, even though dragEnterEvent accepted the drag.
-        if event.mimeData().hasUrls() or _mime_has_file_promise(event.mimeData()):
+        if _should_accept_drag(event):
             event.acceptProposedAction()
     def dropEvent(self, event):
         handled = resolve_drop_paths(event.mimeData(), tempfile.gettempdir(), self._push_dropped_paths_default,
@@ -1443,9 +1790,8 @@ class ADBClient(QMainWindow):
         Finder watches, so it can show a real percentage on large/slow
         transfers instead of a static "Preparing..." spinner."""
         if self.process.state() != QProcess.ProcessState.NotRunning or (self.transfer_thread and self.transfer_thread.isRunning()):
-            self.log("Drag-out failed: another transfer is already in progress. "
-                     "Wait for it to finish (or stop it) before dragging another file out.")
-            self._call_promise_handler(handler, "Another transfer is already running.")
+            self._promise_queue.append((remote_path, dest_path, handler, progress))
+            self.log(f"Drag-out queued: {os.path.basename(remote_path.rstrip('/'))}", skip_announce=True)
             return
 
         def on_progress(percent, mb_sec, mb_trans, filename):
@@ -1455,15 +1801,12 @@ class ADBClient(QMainWindow):
                 except Exception:
                     pass
 
+        completed = {"value": False}
+
         def on_complete(success, message):
-            try:
-                self.transfer_thread.finished_transfer.disconnect(on_complete)
-            except Exception:
-                pass
-            try:
-                self.transfer_thread.progress_update.disconnect(on_progress)
-            except Exception:
-                pass
+            if completed["value"]:
+                return
+            completed["value"] = True
             if progress is not None:
                 try:
                     progress.setCompletedUnitCount_(100)
@@ -1478,14 +1821,33 @@ class ADBClient(QMainWindow):
                 # operation could not be completed" with no real detail).
                 self.log(f"Drag-out to Finder FAILED for {remote_path}:\n{message}")
                 self._call_promise_handler(handler, str(message)[:200])
+            # Defer: finished_transfer is emitted from run() before QThread
+            # actually stops, so starting the next one inline would look like
+            # "still busy" and leave the queue stranded.
+            QTimer.singleShot(0, self._drain_promise_queue)
 
-        self.execute_internal_transfer("pull", remote_path, dest_path)
-        if self.transfer_thread:
-            self.transfer_thread.progress_update.connect(on_progress)
-            self.transfer_thread.finished_transfer.connect(on_complete)
-        else:
+        # Connect the callbacks BEFORE the thread starts. The old code started
+        # the thread first and connected afterwards, so a fast transfer could
+        # finish before on_complete was attached and Finder's promise was never
+        # completed (it just spun forever).
+        thread = self.execute_internal_transfer(
+            "pull", remote_path, dest_path,
+            on_progress=on_progress, on_finished=on_complete
+        )
+        if thread is None:
             self.log(f"Drag-out to Finder FAILED: could not start a transfer thread for {remote_path}.")
             self._call_promise_handler(handler, "Could not start transfer.")
+            QTimer.singleShot(0, self._drain_promise_queue)
+    def _drain_promise_queue(self):
+        """Start the next queued Finder drag-out once the GUI thread is idle."""
+        if not self._promise_queue:
+            return
+        if self.process.state() != QProcess.ProcessState.NotRunning or (self.transfer_thread and self.transfer_thread.isRunning()):
+            QTimer.singleShot(200, self._drain_promise_queue)
+            return
+        item = self._promise_queue.pop(0)
+        self._handle_promise_pull(*item)
+
     def _call_promise_handler(self, handler, error_message):
         if handler is None:
             return
@@ -1719,6 +2081,8 @@ class ADBClient(QMainWindow):
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setText(f"Welcome to version {APP_VERSION}!\n\n"
                     "What's New:\n"
+                    "- Multi-select in the File Manager: Control/Command-click items or use Select All, then Copy, Move, Delete, or drag them together.\n"
+                    "- macOS File Promise drag-and-drop fixes for both dragging files out to Finder and dropping promised files into the app.\n"
                     "- Main window accessibility: removed the section boxes and hidden container that VoiceOver treated as groups. Section titles are now plain headings and every control sits directly on the page.\n"
                     "- Fixed multi-file drops of native macOS File Promises, and failed promise drops now report an error in the Terminal Output log.\n"
                     "- The window now registers for native file promise drag types, which Qt does not do on its own.\n"
@@ -1758,10 +2122,17 @@ class ADBClient(QMainWindow):
             
         self.execute_tool(selected_tool, args)
         self.cmd_input.clear()
-    def execute_internal_transfer(self, action, src, dest):
+    def execute_internal_transfer(self, action, src, dest, on_progress=None, on_finished=None):
+        """Start an internal transfer. `src` may be a single path or a list of
+        paths (multi-selection in the file manager). The optional callbacks are
+        connected before the thread starts so fast transfers cannot finish
+        before a caller (e.g. a macOS file promise) is listening."""
         if self.process.state() != QProcess.ProcessState.NotRunning or (self.transfer_thread and self.transfer_thread.isRunning()):
             self.log("A process is already running. Please wait or stop it first.")
-            return
+            return None
+        src_list = list(src) if isinstance(src, (list, tuple)) else [src]
+        if not src_list:
+            return None
         self.is_file_transfer = True
         self.current_percent = 0
         self.last_announced_percent = 0
@@ -1775,14 +2146,19 @@ class ADBClient(QMainWindow):
         
         if self.announce_transfers:
             self.announce(f"{action.replace('_', ' ').capitalize()} started.")
-        self.log(f"\nInitiating {action} for: {src}", skip_announce=True)
+        self.log(f"\nInitiating {action} for: {', '.join(src_list)}", skip_announce=True)
         
         self.stop_btn.setEnabled(True)
         self.wizard_btn.setEnabled(False)
-        self.transfer_thread = AdbTransferThread(self.adb_path, self.get_current_serial(), action, [src], dest)
+        self.transfer_thread = AdbTransferThread(self.adb_path, self.get_current_serial(), action, src_list, dest)
         self.transfer_thread.progress_update.connect(self.handle_thread_progress)
         self.transfer_thread.finished_transfer.connect(self.handle_thread_finished)
+        if on_progress is not None:
+            self.transfer_thread.progress_update.connect(on_progress)
+        if on_finished is not None:
+            self.transfer_thread.finished_transfer.connect(on_finished)
         self.transfer_thread.start()
+        return self.transfer_thread
     def execute_tool(self, tool_name, args):
         if self.process.state() != QProcess.ProcessState.NotRunning or (self.transfer_thread and self.transfer_thread.isRunning()):
             self.log("A process is already running. Please wait or stop it first.")
@@ -1971,4 +2347,5 @@ if __name__ == "__main__":
     window.raise_()
     window.activateWindow()
     
+
     sys.exit(app.exec())
